@@ -76,12 +76,20 @@ async def enqueue_direct_index_actions(
     action_counts = Counter(action.action.value for action in actions)
     enqueued_any = False
 
-    delete_ids = [action.record_id for action in actions if action.action == IndexAction.DELETE]
-    if delete_ids:
+    from openviking.storage.queuefs.resource_embedding_fence import _resource_uri
+
+    deletes = [action for action in actions if action.action == IndexAction.DELETE]
+    groups = [[action] for action in deletes if _resource_uri(action.uri)]
+    nonresource = [action for action in deletes if not _resource_uri(action.uri)]
+    if nonresource:
+        groups.append(nonresource)
+    for group in groups:
+        action = group[0]
         message = EmbeddingMsg.for_delete(
-            record_ids=delete_ids,
+            record_ids=[item.record_id for item in group],
             context_data={
-                "uri": actions[0].uri,
+                "uri": action.uri,
+                "level": action.level,
                 "account_id": ctx.account_id,
                 "owner_user_id": ctx.user.user_id,
             },
