@@ -450,6 +450,13 @@ class FSService:
                 await viking_fs.mkdir(uri, ctx=ctx)
                 return
 
+        from openviking.storage.pathlock_transfer import PathLockGuard
+        from openviking.storage.queuefs.resource_embedding_fence import _resource_uri
+
+        admitted = None
+        if _resource_uri(directory_uri):
+            await viking_fs._ensure_access(directory_uri, ctx, action=AclAction.WRITE)
+            admitted = await viking_fs._capture_resource_identity(ctx)
         versions = self.compile_versions
         managed = versions is not None and await versions.owning_target(
             ctx.account_id, directory_uri
@@ -463,7 +470,7 @@ class FSService:
                     else None
                 )
                 lease = None
-                if managed:
+                if managed or admitted is not None:
                     await viking_fs._ensure_access(directory_uri, ctx, action=AclAction.WRITE)
                     parent = VikingURI(directory_uri).parent.uri
                     while not await viking_fs.exists(parent, ctx=ctx):
@@ -471,18 +478,26 @@ class FSService:
                     lease = await viking_fs._async_agfs.pathlock_acquire_tree(
                         viking_fs._uri_to_path(parent, ctx=ctx)
                     )
+                coverage_guard = PathLockGuard(viking_fs._async_agfs)
                 try:
+                    if admitted is not None:
+                        await coverage_guard.acquire(
+                            lambda: viking_fs._acquire_resource_coverage(
+                                ctx, admitted, owner_lease_ref=lease
+                            )
+                        )
                     await viking_fs.mkdir(uri, ctx=ctx, **({"lease_ref": lease} if lease else {}))
                     if managed:
                         await versions.record_effects(
                             [{"uri": directory_uri, "kind": "directory"}], ctx
                         )
-                    else:
+                    elif lease is None:
                         lease = await viking_fs._async_agfs.pathlock_acquire_exact(
                             viking_fs._uri_to_path(abstract_uri, ctx=ctx)
                         )
                     await initialize(acl_update, lease)
                 finally:
+                    await coverage_guard.close()
                     if lease is not None:
                         await viking_fs._async_agfs.pathlock_release(lease)
 
@@ -513,15 +528,36 @@ class FSService:
                 ctx=ctx,
                 lease_ref=lease,
             )
-            await vectorize_directory_meta(
-                uri=directory_uri,
-                abstract=abstract,
-                overview="",
-                context_type=context_type_for_uri(directory_uri),
-                ctx=ctx,
-                ingest_options=IngestOptions(acl_update=acl_update),
-                include_overview=False,
+            from contextlib import nullcontext
+
+            from openviking.storage.abstract_overview import body_for_preview
+            from openviking.storage.queuefs.resource_embedding_fence import (
+                ResourceEmbeddingProducer,
+                bind_resource_embedding_producer,
             )
+            from openviking.utils.content_hash import content_md5
+
+            binding = nullcontext()
+            md5s = None
+            if admitted is not None:
+                raw = await viking_fs.read_file_bytes(abstract_uri, ctx=ctx)
+                abstract = body_for_preview(raw)
+                md5s = {int(ContextLevel.ABSTRACT): content_md5(abstract.encode())}
+                binding = bind_resource_embedding_producer(
+                    ResourceEmbeddingProducer(ctx, admitted, lease)
+                )
+            with binding:
+                await vectorize_directory_meta(
+                    uri=directory_uri,
+                    abstract=abstract,
+                    overview="",
+                    context_type=context_type_for_uri(directory_uri),
+                    ctx=ctx,
+                    ingest_options=IngestOptions(acl_update=acl_update),
+                    include_overview=False,
+                    content_is_body=admitted is not None,
+                    md5s=md5s,
+                )
 
         if managed:
             await run_to_completion(
@@ -544,12 +580,17 @@ class FSService:
         return directory_uri, abstract_uri
 
     async def remove_resource_only(
-        self, uri: str, ctx: RequestContext, *, recursive: bool = False,
+        self,
+        uri: str,
+        ctx: RequestContext,
+        *,
+        recursive: bool = False,
     ) -> Dict[str, Any]:
         from openviking.service.resource_maintenance import (
             maintain_resource,
             validate_resource_target,
         )
+
         validate_resource_target(uri)
         return await maintain_resource(self._ensure_initialized(), uri, ctx, recursive=recursive)
 
@@ -558,6 +599,7 @@ class FSService:
             maintain_resource,
             validate_resource_target,
         )
+
         validate_resource_target(uri)
         return await maintain_resource(self._ensure_initialized(), uri, ctx, prune=True)
 
@@ -1016,9 +1058,7 @@ class FSService:
             target_stat = await viking_fs.stat(to_uri, ctx=ctx, skip_count=True)
             target_is_dir = bool(target_stat.get("isDir"))
             rebuild_root_uri = (
-                to_uri
-                if target_is_dir
-                else self._semantic_refresh_parent_uri(to_uri, context_type)
+                to_uri if target_is_dir else self._semantic_refresh_parent_uri(to_uri, context_type)
             )
             if not rebuild_root_uri:
                 result["semantic_status"] = "skipped"
@@ -1119,7 +1159,9 @@ class FSService:
         for uri in uris:
             self._reject_storage_internal_target(uri)
             if is_watch_task_control_uri(uri):
-                raise PermissionDeniedError("watch-task control state cannot be replaced", resource=uri)
+                raise PermissionDeniedError(
+                    "watch-task control state cannot be replaced", resource=uri
+                )
         viking_fs = self._ensure_initialized()
 
         async def run() -> Dict[str, Any]:
@@ -1160,15 +1202,24 @@ class FSService:
             lease = await viking_fs._acquire_resource_coverage(ctx, admitted, requests=requests)
         try:
             return await self._mv_and_refresh_covered(
-                from_uri, to_uri, ctx=ctx, no_replace=no_replace, coverage=lease,
+                from_uri,
+                to_uri,
+                ctx=ctx,
+                no_replace=no_replace,
+                coverage=lease,
             )
         finally:
             if lease is not None:
                 await viking_fs._async_agfs.pathlock_release(lease)
 
     async def _mv_and_refresh_covered(
-        self, from_uri: str, to_uri: str, *, ctx: RequestContext,
-        no_replace: bool = False, coverage=None,
+        self,
+        from_uri: str,
+        to_uri: str,
+        *,
+        ctx: RequestContext,
+        no_replace: bool = False,
+        coverage=None,
     ) -> None:
         """Commit move/watch state and enqueue affected parent refreshes."""
         viking_fs = self._ensure_initialized()
@@ -1262,9 +1313,7 @@ class FSService:
             target_is_dir = bool(target_stat.get("isDir"))
             context_type = context_type_for_uri(to_uri)
             rebuild_root_uri = (
-                to_uri
-                if target_is_dir
-                else self._semantic_refresh_parent_uri(to_uri, context_type)
+                to_uri if target_is_dir else self._semantic_refresh_parent_uri(to_uri, context_type)
             )
             if rebuild_root_uri:
                 try:

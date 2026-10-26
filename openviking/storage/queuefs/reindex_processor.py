@@ -43,8 +43,29 @@ class ReindexProcessor(DequeueHandlerBase):
             bypass_acl=msg.bypass_acl,
         )
 
+    async def _recheck_resource_admission(self, msg: ReindexMsg, ctx: RequestContext):
+        from openviking.service.account_identity import AccountIdentity, recheck_account_identity
+        from openviking.storage.queuefs.resource_embedding_fence import (
+            ResourceEmbeddingConflict,
+            _resource_uri,
+        )
+
+        if not _resource_uri(msg.uri):
+            return False
+        if not msg.resource_creation_identity or msg.lock_handoff is None:
+            raise ResourceEmbeddingConflict("Resource reindex lacks original request admission")
+        await recheck_account_identity(
+            self._viking_fs._account_identity_manager,
+            ctx.account_id,
+            AccountIdentity(msg.resource_creation_identity, False),
+        )
+        return True
+
     async def _adopt_or_reacquire(self, msg: ReindexMsg, ctx: RequestContext) -> Dict[str, Any]:
+        resource = await self._recheck_resource_admission(msg, ctx)
         agfs = self._viking_fs._async_agfs
+        if resource:
+            return await agfs.pathlock_adopt(msg.lock_handoff)
         if msg.lock_handoff is not None:
             try:
                 return await agfs.pathlock_adopt(msg.lock_handoff)
@@ -88,6 +109,13 @@ class ReindexProcessor(DequeueHandlerBase):
         msg = ReindexMsg.from_dict(payload)
         ctx = self._ctx(msg)
         tracker = get_task_tracker()
+        try:
+            await self._recheck_resource_admission(msg, ctx)
+        except Exception as exc:
+            await tracker.fail(
+                msg.task_id, str(exc), account_id=ctx.account_id, user_id=ctx.user.user_id
+            )
+            return ProcessResult.failed(str(exc))
         task = await tracker.get(
             msg.task_id,
             account_id=ctx.account_id,
@@ -155,6 +183,7 @@ class ReindexProcessor(DequeueHandlerBase):
                     ),
                     ctx=ctx,
                     existing_lease=executor_lease,
+                    resource_creation_identity=msg.resource_creation_identity,
                 )
             metadata = extract_task_metadata(data)
             await tracker.wait_for_task_work(
