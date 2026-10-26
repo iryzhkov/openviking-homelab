@@ -1,0 +1,21 @@
+# Resources-only maintenance
+
+These additive endpoints require an authenticated account context and an authoritative account identity manager with a D2 account creation identity. They fail closed for deleting, missing or recreated account identities, including ROOT. Older backends have no matching routes and return 404.
+
+POST /api/v1/fs/resources-only/remove accepts exactly {"uri":"viking://resources/project/file.md","recursive":false}. Unknown fields and coerced booleans are rejected. A directory, even an empty one, requires recursive=true. The node must exist. Use the prune endpoint for an absent URI.
+
+POST /api/v1/fs/resources-only/prune-index accepts exactly {"uri":"viking://resources/project/missing.md"}. It refuses every existing node, including empty directories, before index mutation. It removes only this account's exact normalized URI records, including the native trailing-slash equivalent. Native index URI encoding and ACL identity canonicalize trailing slashes; these are the same resource identity. No new index query or policy bypass is added. It never enumerates index descendants. Descendant orphan records remain untouched; recursive orphan pruning is unsupported because the filesystem collector cannot discover or ACL-qualify them.
+
+Both endpoints accept only literal, exact paths strictly below viking://resources. The namespace root is rejected even for ROOT. User, agent and session namespaces, record IDs, aliases, path variables, relative segments, repeated/trailing separators, whitespace, controls, percent escapes, storage-internal names, backslashes, query and fragment spellings are rejected before backend calls. URI length is bounded at 2048 characters. Names such as tasks or _system below resources remain ordinary content under the existing namespace contract.
+
+Actual native MANAGE and WRITE checks apply to the requested URI. Existing-directory deletion retains low-level descendant MANAGE checks with enabled ACLs. Exact orphan pruning checks the absent canonical URI through the same ACL implementation and retains its existing policy snapshot semantics. It grants no new ROOT or bypass capability.
+
+An account-checked resources-root Tree lease covers the final existence assertion and the full low-level rm call. rm extends that owner's coverage, freshly rechecks the authoritative account identity and node type, and releases its extension in finally. The service releases its outer lease in finally. Same-account resources writers using these locks contend for that root; other accounts remain separate.
+
+The new path calls VikingFS.rm directly. It invokes no linked resource-memory extraction cleanup, parent semantic or memory overview refresh, watch synchronization, Compile version callback, task tracking, global queue wait or queue status. Existing DELETE /api/v1/fs retains all of its defaults and callbacks.
+
+Removal deletes the selected filesystem node/subtree and index records associated with the filesystem URIs collected by rm. It does not discover unrelated orphan index descendants. Parent summaries and extraction links may remain stale. This endpoint neither rebuilds nor qualifies the index as fresh. It does not fence producers that bypass the resource path-lock contract, stale queue replay, direct disk writes or arbitrary index upserts.
+
+Success returns only {"uri":...,"outcome":"removed"} or {"uri":...,"outcome":"pruned"} in the usual response envelope. No counts, record metadata, lease owners or queue activity are returned. Errors expose a bounded generic message, requested URI and outcome. not_started means the rm call was not entered; unknown means it was entered and partial deletion may have occurred. Index deletion precedes filesystem deletion and is not rolled back on a later failure. A failed lease release cannot produce success.
+
+Calls run inline without a durable task. Cancellation propagates and both lease finally blocks execute during normal coroutine unwinding; cancellation can leave partial effects and never implies rollback or a completed response. A disconnect, repeated cancellation, process death or lost backend response needs an explicit state check before retrying. No journal, placeholder or background reconciliation is added.
