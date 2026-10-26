@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import socket
@@ -35,10 +36,16 @@ RAW = ROOT + "/raw.md"
 def owner(value):
     if value is None:
         return None
-    return {
-        **{key: value.get(key) for key in ("owner_id", "lease_ref", "lock_paths")},
-        "capability_sha256": hashlib.sha256(str(value.get("ownership_ref")).encode()).hexdigest(),
-    }
+    observed = {key: value.get(key) for key in ("owner_id", "lease_ref", "lock_paths")}
+    capability = value.get("ownership_ref")
+    if isinstance(capability, str) and capability:
+        observed.update(
+            capability_state="observed",
+            capability_sha256=hashlib.sha256(capability.encode()).hexdigest(),
+        )
+    else:
+        observed["capability_state"] = "not_observed"
+    return observed
 
 
 @asynccontextmanager
@@ -120,19 +127,67 @@ async def test_sdk_raw_parent_original_admission(admitted_service, app, monkeypa
     finish = ResourceProcessor.finish_prepared_resource
 
     async def finish_prepared(self, prepared, **kwargs):
+        from openviking.storage.context_update_plan import ContextUpdatePlan
+
+        plan = ContextUpdatePlan.from_dict(prepared["context_update_plan"])
+        actions = plan.direct_index_actions
+        capture = self._prepared_index_owner(
+            prepared, kwargs["ctx"], execution_owner=kwargs["resource_lock"]
+        )
+        conditions = prepared.get("resource_index_conditions")
+        assert isinstance(conditions, dict)
+        if actions:
+            assert capture is not None
+            assert all(
+                f"{action.action.value}:{action.record_id}" in conditions for action in actions
+            )
+        else:
+            assert capture is None and not conditions
         record(
             "finish_enter",
             identity=prepared["resource_creation_identity"],
             owner=owner(kwargs["resource_lock"]),
-            capture=owner(
-                self._prepared_index_owner(
-                    prepared, kwargs["ctx"], execution_owner=kwargs["resource_lock"]
-                )
-            ),
+            direct_index_action_count=len(actions),
+            capture=owner(capture),
+            capture_conditions={
+                key: {
+                    **{
+                        field: value.get(field)
+                        for field in (
+                            "account_id",
+                            "creation_identity",
+                            "uri",
+                            "level",
+                            "record_id",
+                            "action",
+                            "context_sha256",
+                            "input_sha256",
+                            "input_state",
+                            "intent_sha256",
+                        )
+                        if field in value
+                    },
+                    "owner": owner(value.get("owner")),
+                }
+                for key, value in conditions.items()
+            },
         )
-        return await finish(self, prepared, **kwargs)
+        result = await finish(self, prepared, **kwargs)
+        record("finish_return")
+        return result
 
     monkeypatch.setattr(ResourceProcessor, "finish_prepared_resource", finish_prepared)
+    for method in ("_capture_resource_identity", "_acquire_resource_coverage"):
+        original = getattr(fs, method)
+
+        async def observe_authority(*args, _original=original, _method=method, **kwargs):
+            caller = inspect.currentframe().f_back.f_code
+            record(
+                "authority_call", method=_method, caller=caller.co_filename, function=caller.co_name
+            )
+            return await _original(*args, **kwargs)
+
+        monkeypatch.setattr(fs, method, observe_authority)
     refresh = Summarizer.refresh_file_parent
 
     async def refresh_parent(self, **kwargs):
@@ -257,24 +312,62 @@ async def test_sdk_raw_parent_original_admission(admitted_service, app, monkeypa
         original["owner"],
         one("add_adopted")["owner"],
         execution["owner"],
-        execution["capture"],
         producer["owner"],
         queued["owner"],
         consumer["owner"],
         adopted["owner"],
     ]
+    if execution["direct_index_action_count"]:
+        assert execution["capture"] is not None and execution["capture_conditions"]
+        owners.append(execution["capture"])
+    else:
+        assert execution["capture"] is None and execution["capture_conditions"] == {}
+    assert all(value is not None for value in owners)
     assert all(value["owner_id"] == owners[0]["owner_id"] for value in owners)
     assert all(value["lock_paths"] == owners[0]["lock_paths"] for value in owners)
-    assert owners[0]["capability_sha256"] != execution["owner"]["capability_sha256"]
+    assert one("add_adopted")["owner"] == execution["owner"]
+    assert (
+        producer["owner"]["lease_ref"]
+        == queued["owner"]["lease_ref"]
+        == execution["owner"]["lease_ref"]
+    )
+    assert consumer["owner"] == queued["owner"]
+    for value in owners:
+        if value["capability_state"] == "not_observed":
+            assert "capability_sha256" not in value
+    assert (
+        execution["owner"]["capability_state"] == adopted["owner"]["capability_state"] == "observed"
+    )
     assert execution["owner"]["capability_sha256"] != adopted["owner"]["capability_sha256"]
-    stop = events.index(one("semantic_finish_start"))
+    stop = events.index(one("semantic_finish_done"))
     assert not any(
         event["event"] == "release_attempt" and event["owner"] == execution["owner"]
         for event in events[events.index(execution) : stop]
     )
     assert one("semantic_finish_done")["succeeded"] is True
+    producer_releases = [
+        index
+        for index, event in enumerate(events)
+        if event["event"] == "release_attempt" and event["owner"] == execution["owner"]
+    ]
+    assert len(producer_releases) == 1 and producer_releases[0] > stop
+    consumer_releases = [
+        index
+        for index, event in enumerate(events)
+        if event["event"] == "release_attempt" and event["owner"] == adopted["owner"]
+    ]
+    assert len(consumer_releases) == 1
+    assert events.index(one("semantic_finish_start")) < consumer_releases[0] < stop
+    assert not any(
+        event["event"] == "authority_call"
+        and Path(event["caller"]).name in {"resource_processor.py", "summarizer.py"}
+        for event in events[events.index(execution) : events.index(one("finish_return"))]
+    )
+    proof["parent_bodies"] = {}
     for name in (".abstract.md", ".overview.md"):
-        assert await fs.read_file_bytes(ROOT + "/" + name, ctx=ctx)
+        raw = await fs.read_file_bytes(ROOT + "/" + name, ctx=ctx)
+        assert raw
+        proof["parent_bodies"][name] = hashlib.sha256(raw).hexdigest()
     proof["state"] = "passed"
     record("native_parent_refresh_verified")
 
