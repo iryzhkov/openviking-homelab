@@ -1,7 +1,16 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 """Data structures returned by account storage operations."""
+from dataclasses import dataclass
 from typing import TypedDict
+
+
+@dataclass(frozen=True)
+class AccountIdentity:
+    """Internal authoritative account lifetime, never a public account summary."""
+
+    creation_identity: str
+    deleting: bool
 
 
 class DeletionRecord(TypedDict, total=False):

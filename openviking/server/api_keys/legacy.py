@@ -10,6 +10,7 @@ import hmac
 import json
 from datetime import datetime, timezone
 from typing import Dict, Optional
+from uuid import UUID, uuid4
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError
@@ -20,6 +21,7 @@ from openviking.pyagfs import AGFSAlreadyExistsError, AGFSNotFoundError, AsyncAG
 from openviking.pyagfs.async_client import fs_ctx_from_agfs_path
 from openviking.server.account_stores.base import AccountStore
 from openviking.server.account_stores.models import (
+    AccountIdentity,
     AccountSummary,
     DeletionRecord,
     GroupSummary,
@@ -118,6 +120,11 @@ class FileStore(AccountStore):
             raise InvalidArgumentError(
                 f"account_store.params cannot override framework parameters: {names}"
             )
+        initialize_creation_ids = params.pop("initialize_creation_ids", False)
+        if not isinstance(initialize_creation_ids, bool):
+            raise InvalidArgumentError("initialize_creation_ids must be a boolean")
+        # An explicit startup-only migration selection, never an ordinary read.
+        self._initialize_creation_ids = initialize_creation_ids
         configured_watch_enabled = params.pop("watch_enabled", watch_enabled)
         configured_watch_interval = params.pop(
             "watch_interval_seconds", watch_interval_seconds
@@ -181,23 +188,20 @@ class FileStore(AccountStore):
 
     async def _rollback_create_account(self, account_id: str, *, account_was_created: bool) -> None:
         """Best-effort rollback for partially persisted account creation."""
-        self._discard_account_state(account_id)
-        if not account_was_created:
-            return
         try:
-            await self._save_accounts_json(delete_account_ids={account_id})
+            if account_was_created:
+                # Retain the expected creation identity until the guarded
+                # registry deletion finishes. Never remove a peer's new account.
+                await self._save_accounts_json(delete_account_ids={account_id})
         except Exception:
             logger.exception("Failed to persist rollback for account %s", account_id)
+        finally:
+            self._discard_account_state(account_id)
 
     async def load(self) -> None:
         """Load keys into memory (writable startup path; migrates plaintext; see reload())."""
         async with self._mutation_lock:
-            accounts_data = await self._read_json(ACCOUNTS_PATH)
-            if accounts_data is None:
-                # First run: create default account
-                now = datetime.now(timezone.utc).isoformat()
-                accounts_data = {"accounts": {"default": {"created_at": now}}}
-                await self._write_json(ACCOUNTS_PATH, accounts_data)
+            accounts_data = await self._initialize_account_registry()
 
             accounts, prefix_index, user_group_ids = await self._build_state(
                 accounts_data, allow_migration=True
@@ -211,6 +215,58 @@ class FileStore(AccountStore):
                 sum(len(info.users) for info in self._accounts.values()),
             )
         self._start_watcher()
+
+    @staticmethod
+    def _creation_id(record: dict) -> str:
+        value = record.get("creation_id")
+        try:
+            parsed = UUID(value) if isinstance(value, str) else None
+        except ValueError:
+            parsed = None
+        if parsed is None or parsed.version != 4 or str(parsed) != value:
+            raise FailedPreconditionError(
+                "Account creation identity is missing or invalid; explicit initialization required"
+            )
+        return value
+
+    async def _initialize_account_registry(self) -> dict:
+        """Initialize a new registry, or explicitly backfill existing records.
+
+        Reuse the registry writer's Exact lease and authoritative read. The
+        opt-in flag defaults off; no read/refresh path calls this migration.
+        """
+        lease = await self._async_agfs.pathlock_acquire_exact(ACCOUNTS_PATH, timeout_secs=10.0)
+        try:
+            data = await self._read_json(ACCOUNTS_PATH, bypass_cache=True)
+            changed = data is None
+            if data is None:
+                data = {
+                    "accounts": {
+                        "default": {
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "creation_id": str(uuid4()),
+                        }
+                    }
+                }
+            accounts = data.get("accounts")
+            if not isinstance(accounts, dict) or any(
+                not isinstance(record, dict) for record in accounts.values()
+            ):
+                raise FailedPreconditionError("Invalid account registry")
+            if self._initialize_creation_ids:
+                # Validate every existing ID before mutating or persisting.
+                for record in accounts.values():
+                    if "creation_id" in record:
+                        self._creation_id(record)
+                for record in accounts.values():
+                    if "creation_id" not in record:
+                        record["creation_id"] = str(uuid4())
+                        changed = True
+            if changed:
+                await self._write_json(ACCOUNTS_PATH, data, lease_ref=lease)
+            return data
+        finally:
+            await self._async_agfs.pathlock_release(lease)
 
     def _start_watcher(self) -> None:
         if not self._watch_enabled or self._watch_task is not None:
@@ -267,7 +323,9 @@ class FileStore(AccountStore):
         async with self._reload_lock:
             accounts_data = await self._read_json(ACCOUNTS_PATH)
             if accounts_data is None:
-                # Store not initialized yet (reader started before writer): keep state.
+                self._accounts = {}
+                self._prefix_index = {}
+                self._user_group_ids = {}
                 return
 
             accounts, prefix_index, user_group_ids = await self._build_state(
@@ -284,8 +342,11 @@ class FileStore(AccountStore):
             )
 
     async def _refresh_accounts_from_store_unlocked(self) -> None:
-        accounts_data = await self._read_json(ACCOUNTS_PATH)
+        accounts_data = await self._read_json(ACCOUNTS_PATH, bypass_cache=True)
         if accounts_data is None:
+            self._accounts = {}
+            self._prefix_index = {}
+            self._user_group_ids = {}
             return
         persisted_accounts = accounts_data.get("accounts", {})
 
@@ -294,17 +355,21 @@ class FileStore(AccountStore):
         for account_id, info in persisted_accounts.items():
             created_at = info.get("created_at", "")
             account = self._accounts.get(account_id)
-            if account is not None and account.created_at != created_at:
+            if account is not None and (
+                account.created_at != created_at or account.creation_id != info.get("creation_id")
+            ):
                 self._discard_account_state(account_id)
                 account = None
             if account is None:
                 self._accounts[account_id] = AccountInfo(
                     created_at=created_at,
+                    creation_id=info.get("creation_id"),
                     groups_loaded=False,
                     deletion=info.get("deletion"),
                 )
             else:
                 account.created_at = created_at
+                account.creation_id = info.get("creation_id")
                 account.deletion = info.get("deletion")
 
     async def _refresh_account_users_from_store_unlocked(self, account_id: str) -> None:
@@ -369,6 +434,7 @@ class FileStore(AccountStore):
 
             accounts[account_id] = AccountInfo(
                 created_at=info.get("created_at", ""),
+                creation_id=info.get("creation_id"),
                 users=users,
                 groups=groups,
                 deletion=info.get("deletion"),
@@ -486,6 +552,7 @@ class FileStore(AccountStore):
                 user_info["key_prefix"] = self._get_key_prefix(api_key)
         self._accounts[account_id] = AccountInfo(
             created_at=now,
+            creation_id=str(uuid4()),
             users={admin_user_id: user_info},
             groups={},
         )
@@ -680,7 +747,9 @@ class FileStore(AccountStore):
             for account_id in normalized:
                 if account_id not in persisted_accounts:
                     validate_file_account_id(account_id)
-                    persisted_accounts[account_id] = {"created_at": now}
+                    persisted_accounts[account_id] = {
+                        "created_at": now, "creation_id": str(uuid4())
+                    }
                     created_accounts += 1
             if created_accounts:
                 await self._write_json(ACCOUNTS_PATH, accounts_data, lease_ref=accounts_lease)
@@ -719,6 +788,7 @@ class FileStore(AccountStore):
                     account_info = persisted_accounts[account_id]
                     account = AccountInfo(
                         created_at=account_info.get("created_at", now),
+                        creation_id=account_info.get("creation_id"),
                         users={},
                         groups={},
                         groups_loaded=False,
@@ -1250,17 +1320,23 @@ class FileStore(AccountStore):
         )
         return ph.hash(api_key)
 
-    async def _read_json(self, path: str) -> Optional[dict]:
+    async def _read_json(self, path: str, *, bypass_cache: bool = False) -> Optional[dict]:
         """Read a JSON file from AGFS with encryption support. Returns None if not found."""
         try:
-            content = await self._async_agfs.read(path)
+            fs_ctx = fs_ctx_from_agfs_path(path)
+            if bypass_cache:
+                fs_ctx["bypass_cache"] = "true"
+            content = await self._async_agfs.read(path, fs_ctx=fs_ctx)
             if isinstance(content, bytes):
                 raw = content
             else:
                 raw = content.content if hasattr(content, "content") else b""
 
             text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-            return json.loads(text)
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                raise FailedPreconditionError("Registry document must be a JSON object")
+            return data
         except AGFSNotFoundError:
             return None
 
@@ -1322,7 +1398,7 @@ class FileStore(AccountStore):
         self._prefix_index = prefix_index
 
     async def _read_accounts_for_update(self) -> dict:
-        data = await self._read_json(ACCOUNTS_PATH)
+        data = await self._read_json(ACCOUNTS_PATH, bypass_cache=True)
         if data is None:
             raise FailedPreconditionError(
                 "Account registry is missing; refusing to overwrite it with account changes."
@@ -1357,11 +1433,26 @@ class FileStore(AccountStore):
                 if info is None:
                     continue
                 if account_id not in accounts:
+                    if account_id not in (reject_existing_account_ids or set()):
+                        raise FailedPreconditionError("Account disappeared; refusing to recreate it")
                     created_account_ids.add(account_id)
-                accounts[account_id] = {"created_at": info.created_at}
+                    accounts[account_id] = {"created_at": info.created_at}
+                    if info.creation_id is not None:
+                        accounts[account_id]["creation_id"] = info.creation_id
+                record = accounts[account_id]
+                if record.get("creation_id") != info.creation_id:
+                    raise FailedPreconditionError("Account identity changed; reload before updating")
+                # Preserve immutable identity, unknown fields and a newer fence.
+                record["created_at"] = info.created_at
                 if info.deletion is not None:
-                    accounts[account_id]["deletion"] = dict(info.deletion)
+                    record["deletion"] = dict(info.deletion)
             for account_id in delete_account_ids or set():
+                record = accounts.get(account_id)
+                info = self._accounts.get(account_id)
+                if record is not None and (
+                    info is None or record.get("creation_id") != info.creation_id
+                ):
+                    raise FailedPreconditionError("Account identity changed; refusing stale deletion")
                 accounts.pop(account_id, None)
             await self._write_json(ACCOUNTS_PATH, data, lease_ref=lease)
             return created_account_ids
@@ -1444,6 +1535,28 @@ class FileStore(AccountStore):
         if not self._watcher_running():
             async with self._reload_lock:
                 await self._refresh_account_users_from_store_unlocked(account_id)
+
+    async def get_account_identity(self, account_id: str) -> AccountIdentity | None:
+        # Bypass both watcher state and backend cache, even for ROOT callers.
+        async with self._mutation_lock:
+            data = await self._read_json(ACCOUNTS_PATH, bypass_cache=True)
+            if data is None:
+                self._accounts = {}
+                self._prefix_index = {}
+                self._user_group_ids = {}
+                return None
+            accounts = data.get("accounts")
+            if not isinstance(accounts, dict):
+                raise FailedPreconditionError("Invalid account registry")
+            if account_id not in accounts:
+                return None
+            record = accounts[account_id]
+            if not isinstance(record, dict):
+                raise FailedPreconditionError("Invalid account record")
+            return AccountIdentity(
+                creation_identity=f"legacy:{self._creation_id(record)}",
+                deleting=record.get("deletion") is not None,
+            )
 
     async def get_account(self, account_id: str) -> AccountSummary | None:
         await self._refresh_accounts_for_management_read()

@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import (
 from openviking.core.identifiers import MAX_IDENTIFIER_LENGTH
 from openviking.server.account_stores.base import AccountStore
 from openviking.server.account_stores.models import (
+    AccountIdentity,
     AccountSummary,
     DeletionRecord,
     GroupSummary,
@@ -432,6 +433,23 @@ class MySQLAccountStore(AccountStore):
             "status": "deleting" if account.deletion_task_id else "active",
             **({"task_id": account.deletion_task_id} if account.deletion_task_id else {}),
         }
+
+    async def get_account_identity(self, account_id: str) -> AccountIdentity | None:
+        # Each call owns a new authoritative session, including the final
+        # under-lease recheck. Never reuse an admission transaction/snapshot.
+        async with self._session_factory() as session:
+            account = await session.scalar(
+                select(Account).where(
+                    Account.service_name == self._service_name,
+                    Account.account_id == account_id,
+                )
+            )
+            if account is None:
+                return None
+            return AccountIdentity(
+                creation_identity=f"mysql:{self._service_name}:{account.account_pk}",
+                deleting=account.deletion_task_id is not None,
+            )
 
     async def get_account(self, account_id: str) -> AccountSummary | None:
         async with self._session_factory() as session:

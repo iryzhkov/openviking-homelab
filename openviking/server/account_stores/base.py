@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from typing_extensions import deprecated
 
 from openviking.server.account_stores.models import (
+    AccountIdentity,
     AccountSummary,
     DeletionRecord,
     GroupSummary,
@@ -25,6 +26,12 @@ class AccountStore(ABC):
     async def close(self) -> None: ...
 
     # Account
+    async def get_account_identity(self, account_id: str) -> AccountIdentity | None:
+        """Read authoritative creation identity and fence together, without caching."""
+        from openviking_cli.exceptions import FailedPreconditionError
+
+        raise FailedPreconditionError("Account store does not support lifetime checks")
+
     @abstractmethod
     async def get_account(self, account_id: str) -> AccountSummary | None: ...
 

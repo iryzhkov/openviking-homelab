@@ -316,23 +316,37 @@ async def _wait_for_task(client: httpx.AsyncClient, task_id: str) -> dict:
 # ---- Account CRUD ----
 
 
-async def test_delete_account_files_disables_automatic_pathlock(monkeypatch):
-    """Account cleanup must bypass the deleted tree's automatic PathLock."""
+async def test_delete_account_files_uses_account_tree_lease():
+    """Account vector and file cleanup share owned account coverage."""
     path = "/local/account-to-delete"
+    lease = {"lease_ref": "account-cleanup"}
+    fs_ctx = {"account_id": "account-to-delete", "lease_ref": lease["lease_ref"]}
     agfs = Mock()
+    agfs.pathlock_acquire_tree = AsyncMock(return_value=lease)
+    agfs.pathlock_release = AsyncMock()
     agfs.rm = AsyncMock()
     agfs.stat = AsyncMock(side_effect=AGFSNotFoundError(path))
     service = Mock()
     service.viking_fs._async_agfs = agfs
+    service.viking_fs.vector_store.delete_account_data = AsyncMock()
+    service.viking_fs._pathlock_fs_ctx = Mock(return_value=fs_ctx)
     deletion = DeletionService(
         service=service,
         manager=Mock(),
         service_loop=asyncio.get_running_loop(),
     )
+    ctx = RequestContext(
+        user=UserIdentifier("account-to-delete", "operator"), role=Role.ROOT
+    )
 
-    await deletion._delete_account_files("account-to-delete")
+    await deletion._delete_account_files("account-to-delete", ctx)
 
-    agfs.rm.assert_awaited_once_with(path, recursive=True, auto_pathlock=False)
+    agfs.pathlock_acquire_tree.assert_awaited_once_with(path, timeout_secs=0.0)
+    service.viking_fs.vector_store.delete_account_data.assert_awaited_once_with(
+        "account-to-delete", ctx=ctx
+    )
+    agfs.rm.assert_awaited_once_with(path, recursive=True, fs_ctx=fs_ctx)
+    agfs.pathlock_release.assert_awaited_once_with(lease)
 
 
 @pytest_asyncio.fixture
