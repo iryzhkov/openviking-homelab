@@ -295,6 +295,13 @@ async def _target_records(fs, uri, inventory, old, root_is_file, ctx):
         "": not root_is_file,
         **{key: value.is_dir for key, value in inventory.entries.items()},
     }
+    policies = {}
+    for row in old.records:
+        fields = tree_replace._controls(row)
+        policy = (fields["acl_mode"], tuple(fields["acl_direct_grants"]))
+        if row["uri"] in policies and policies[row["uri"]] != policy:
+            raise FailedPreconditionError("Document controls contain conflicting ACL snapshots")
+        policies[row["uri"]] = policy
     old_by_slot = {(row["uri"][len(uri) :], row.get("level")): row for row in old.records}
     old_root = [row for row in old.records if row["uri"] == uri]
     if any("#" in row["uri"][len(uri) :] for row in old.records):
