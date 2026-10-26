@@ -298,6 +298,43 @@ async def mkdir(
     return Response(status="ok", result={"uri": uri})
 
 
+class ResourceOnlyRemoveRequest(BaseModel):
+    """Remove exactly one resource node or explicitly selected subtree."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    uri: str
+    recursive: bool = False
+
+
+class ResourceIndexPruneRequest(BaseModel):
+    """Prune exact-URI records only when the resource node is absent."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    uri: str
+
+
+@router.post("/resources-only/remove")
+async def remove_resource_only(
+    request: ResourceOnlyRemoveRequest,
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    from openviking.service.resource_maintenance import validate_resource_target
+    uri = validate_resource_target(request.uri)
+    result = await get_service().fs.remove_resource_only(uri, ctx=_ctx, recursive=request.recursive)
+    return Response(status="ok", result=result)
+
+
+@router.post("/resources-only/prune-index")
+async def prune_resource_index(
+    request: ResourceIndexPruneRequest,
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    from openviking.service.resource_maintenance import validate_resource_target
+    uri = validate_resource_target(request.uri)
+    result = await get_service().fs.prune_resource_index(uri, ctx=_ctx)
+    return Response(status="ok", result=result)
+
+
 @router.delete("")
 async def rm(
     uri: str = Query(..., description="Viking URI"),
