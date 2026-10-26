@@ -688,6 +688,12 @@ class ContentWriteCoordinator:
         """
         normalized_root = self._validate_uri_path(root_uri, field_name="root_uri")
         processing_mode = normalize_processing_mode(processing_mode)
+        qualified_resource = self._viking_fs._is_shared_resource_uri(normalized_root) and any(
+            operation.get("expected_absent") or operation.get("expected_sha256") is not None
+            for operation in operations
+        )
+        admitted = (await self._viking_fs._capture_resource_identity(ctx)
+                    if qualified_resource else None)
         await self._validate_batch_root(normalized_root, ctx=ctx)
         normalized_operations = await self._normalize_batch_operations(
             normalized_root, operations, ctx=ctx
@@ -717,7 +723,12 @@ class ContentWriteCoordinator:
             for operation in normalized_operations
         ]
         try:
-            lease = await self._viking_fs._async_agfs.pathlock_acquire_exact_batch(target_paths)
+            if qualified_resource:
+                lease = await self._viking_fs._acquire_resource_coverage(
+                    ctx, admitted, requests=[{"path": path, "kind": "exact"} for path in target_paths],
+                )
+            else:
+                lease = await self._viking_fs._async_agfs.pathlock_acquire_exact_batch(target_paths)
         except LockAcquisitionError as exc:
             raise ResourceBusyError(
                 f"resource is busy and cannot be written now: {normalized_root}",
@@ -739,8 +750,16 @@ class ContentWriteCoordinator:
         write_error: Exception | None = None
         lock_settled = False
         try:
+            if qualified_resource:
+                await self._validate_batch_root(normalized_root, ctx=ctx)
             for operation in normalized_operations:
                 uri = operation["uri"]
+                if qualified_resource:
+                    await self._viking_fs._ensure_access(uri, ctx, action=AclAction.WRITE)
+                    if operation.get("expected_absent") or operation.get("expected_sha256") is not None:
+                        await self._viking_fs._ensure_transfer_parent_directory(
+                            self._viking_fs._uri_to_path(uri, ctx=ctx), uri, operation="batch-write"
+                        )
                 stat = await self._safe_stat(uri, ctx=ctx, allow_not_found=True)
                 exists = not stat.get("not_found")
                 expected_absent = bool(operation.get("expected_absent"))

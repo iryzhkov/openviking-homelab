@@ -171,6 +171,7 @@ async def _initialize_runtime_state(
     await service.apply_agent_evolution_config()
     await _initialize_auth_plugin(app, service, config)
     manager = getattr(app.state, "api_key_manager", None)
+    service.viking_fs.set_account_identity_manager(manager)
     if manager is not None:
         account_count = await service.reconcile_system_assets(manager)
         logger.info("Reconciled system assets for %d active accounts", account_count)

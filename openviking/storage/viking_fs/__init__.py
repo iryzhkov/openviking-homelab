@@ -163,6 +163,11 @@ class VikingFS(
         self._background_tasks: set = set()
         self._deletion_guard: Optional[Callable[[str, str], bool]] = None
         self._privacy_sanitizer: Optional[Any] = None
+        self._account_identity_manager: Optional[Any] = None
+
+    def set_account_identity_manager(self, manager: Optional[Any]) -> None:
+        """Install the owning service's authoritative account-lifetime reader."""
+        self._account_identity_manager = manager
 
     def set_vlm_resolver(self, resolver: "VLMResolver") -> None:
         """Set the VLM resolver supplied by the owning service."""

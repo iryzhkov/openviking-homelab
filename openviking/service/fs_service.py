@@ -1127,7 +1127,32 @@ class FSService:
         ctx: RequestContext,
         no_replace: bool = False,
     ) -> None:
-        """Commit move/watch state and enqueue all affected parent refreshes."""
+        """Hold qualified coverage before version/watch bookkeeping."""
+        viking_fs = self._ensure_initialized()
+        qualified = no_replace and any(
+            viking_fs._is_shared_resource_uri(uri) for uri in (from_uri, to_uri)
+        )
+        lease = None
+        if qualified:
+            admitted = await viking_fs._capture_resource_identity(ctx)
+            requests = [
+                {"path": viking_fs._uri_to_path(uri, ctx=ctx).rsplit("/", 1)[0], "kind": "tree"}
+                for uri in (from_uri, to_uri)
+            ]
+            lease = await viking_fs._acquire_resource_coverage(ctx, admitted, requests=requests)
+        try:
+            return await self._mv_and_refresh_covered(
+                from_uri, to_uri, ctx=ctx, no_replace=no_replace, coverage=lease,
+            )
+        finally:
+            if lease is not None:
+                await viking_fs._async_agfs.pathlock_release(lease)
+
+    async def _mv_and_refresh_covered(
+        self, from_uri: str, to_uri: str, *, ctx: RequestContext,
+        no_replace: bool = False, coverage=None,
+    ) -> None:
+        """Commit move/watch state and enqueue affected parent refreshes."""
         viking_fs = self._ensure_initialized()
         if no_replace:
             # Fail fast before version or watch bookkeeping; VikingFS.mv repeats
@@ -1167,7 +1192,9 @@ class FSService:
                     await watch_manager.validate_target_prefix_rewrite_internal(
                         from_uri, to_uri, account_id=ctx.account_id
                     )
-                async with self._record_transfer(from_uri, to_uri, ctx, move=True) as lease:
+                async with self._record_transfer(
+                    from_uri, to_uri, ctx, move=True, owner_lease_ref=coverage
+                ) as lease:
                     options = {"lease_ref": lease} if lease is not None else {}
                     if vector_mode != "transfer":
                         options.update(
@@ -1248,6 +1275,7 @@ class FSService:
         *,
         move: bool = False,
         recursive: bool = True,
+        owner_lease_ref=None,
     ):
         """Hold managed transfer scopes through their final snapshot registration.
 
@@ -1257,7 +1285,7 @@ class FSService:
         """
         versions = self.compile_versions
         if versions is None:
-            yield None
+            yield owner_lease_ref
             return
         viking_fs = self._ensure_initialized()
         manager = self._get_watch_manager()
@@ -1271,7 +1299,7 @@ class FSService:
             else []
         )
         if not await versions.guard_transfer(from_uri, to_uri, ctx, watched_uris=watched_uris):
-            yield None
+            yield owner_lease_ref
             return
         if move:
             await versions.before_move(from_uri.rstrip("/"), to_uri.rstrip("/"), ctx)
@@ -1306,7 +1334,9 @@ class FSService:
             ]
         else:
             requests = [{"path": path, "kind": "exact"} for path in (source_path, target_path)]
-        lease = await viking_fs._async_agfs.pathlock_acquire_batch(requests)
+        lease = await viking_fs._async_agfs.pathlock_acquire_batch(
+            viking_fs._collapse_lock_requests(requests), owner_lease_ref=owner_lease_ref
+        )
         try:
             yield lease
         finally:

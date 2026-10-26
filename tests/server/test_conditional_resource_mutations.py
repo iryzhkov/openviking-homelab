@@ -13,10 +13,25 @@ import asyncio
 import hashlib
 
 import pytest
+import pytest_asyncio
+
+from openviking.server.api_keys.legacy import FileStore
 
 from openviking.server.identity import RequestContext, Role
 from openviking_cli.exceptions import ConflictError
 from openviking_cli.session.user_id import UserIdentifier
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def authoritative_account_manager(service):
+    """ASGI fixtures bypass application lifespan, so install its real DI explicitly."""
+    manager = FileStore(service.viking_fs, watch_enabled=False)
+    await manager.load()
+    service.viking_fs.set_account_identity_manager(manager)
+    try:
+        yield manager
+    finally:
+        await manager.close()
 
 
 def _root_ctx() -> RequestContext:
@@ -173,7 +188,7 @@ async def test_expected_absent_sees_writer_that_won_before_the_lock(
     client, root = client_with_resource
     target = f"{root}/raced.md"
     agfs = service.viking_fs._async_agfs
-    original = agfs.pathlock_acquire_exact_batch
+    original = agfs.pathlock_acquire_batch
     raced = False
 
     async def acquire_after_competing_write(paths, *args, **kwargs):
@@ -184,7 +199,7 @@ async def test_expected_absent_sees_writer_that_won_before_the_lock(
             await service.viking_fs.write_file(target, "competitor", ctx=_root_ctx())
         return await original(paths, *args, **kwargs)
 
-    monkeypatch.setattr(agfs, "pathlock_acquire_exact_batch", acquire_after_competing_write)
+    monkeypatch.setattr(agfs, "pathlock_acquire_batch", acquire_after_competing_write)
     response = await _batch(
         client, root, [{"uri": target, "content": "mine", "mode": "create", "expected_absent": True}]
     )
@@ -283,7 +298,7 @@ async def test_mv_no_replace_refuses_existing_empty_directory(client_with_resour
 async def test_mv_no_replace_moves_multi_chunk_directory_to_absent_destination(
     client_with_resource,
 ):
-    """The Tree lock may create the missing destination; that is not an occupant."""
+    """Root coverage leaves the destination absent until exclusive creation."""
     client, root = client_with_resource
     source = f"{root}/chunked"
     target = f"{root}/chunked-moved"
@@ -421,7 +436,7 @@ async def test_mv_rechecks_source_type_under_final_lease(
 
     monkeypatch.setattr(agfs, "pathlock_acquire_batch", acquire_after_source_change)
     with pytest.raises(ConflictError):
-        await viking_fs.mv(source, target, ctx=_root_ctx(), vector_mode="none")
+        await viking_fs.mv(source, target, ctx=_root_ctx(), vector_mode="none", no_replace=True)
     assert raced
     if source_kind == "directory":
         assert await _read(client, source) == "competing file"
@@ -429,12 +444,7 @@ async def test_mv_rechecks_source_type_under_final_lease(
         assert await _tree(client, source) == []
     else:
         assert await _read(client, source) is None
-    if original_is_dir:
-        # Existing Tree acquisition can leave an empty destination. This is
-        # still an occupied directory, never evidence of absence or ownership.
-        assert await _tree(client, target) in (None, [])
-    else:
-        assert await _read(client, target) is None
+    assert await _read(client, target) is None
 
 
 # -- fs/replace-tree -----------------------------------------------------------
@@ -584,7 +594,7 @@ async def test_replace_tree_stale_precondition_conflicts_before_any_change(
     assert {uri: await _snapshot(client, uri) for uri in (target, staging, backup)} == before
 
 
-async def test_replace_tree_absent_target_is_created_and_lock_placeholders_removed(
+async def test_replace_tree_absent_target_is_exclusively_created_without_backup_root(
     client_with_resource,
 ):
     client, root = client_with_resource
@@ -705,7 +715,9 @@ async def test_replace_tree_failure_restores_old_tree_and_retains_copies(
     retained = {item["uri"]: item["revision"] for item in details["retained"]}
     assert retained[staging] == new_revision
     if phase == "backup":
-        assert await _tree(client, backup) is None  # only the lock placeholder existed
+        # An exclusively owned empty backup is retained, never inferred disposable.
+        assert await _tree(client, backup) == []
+        assert retained[backup].startswith("tree-sha256:")
     else:
         assert retained[backup] == old_revision
 
@@ -775,7 +787,8 @@ async def test_replace_tree_lease_blocks_other_backend_writers(client_with_resou
     assert observed["create"] == 409
     assert observed["mv_in"] == 409
     assert observed["rm"] in (409, 423)
-    assert observed["unrelated"] == 200
+    # The accepted first prerequisite serializes the entire resources namespace.
+    assert observed["unrelated"] == 409
     assert await _snapshot(client, target) == new_snapshot
     assert await _read(client, outside) == "outside"
 

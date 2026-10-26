@@ -43,6 +43,7 @@ from openviking.storage.viking_fs._base import (
 from openviking.utils.time_utils import format_iso8601, parse_iso_datetime
 from openviking_cli.exceptions import (
     ConflictError,
+    FailedPreconditionError,
     InvalidArgumentError,
     NotFoundError,
     PermissionDeniedError,
@@ -137,6 +138,49 @@ def _rel_path_sort_key(uri: str, root_uri: str) -> List[str]:
 
 class _OpsMixin:
     """Core filesystem operations (read/write/mkdir/rm/mv/stat/glob/tree/ls/temp)."""
+
+    @staticmethod
+    def _is_shared_resource_uri(uri: str) -> bool:
+        return uri.rstrip("/") == "viking://resources" or uri.startswith("viking://resources/")
+
+    @staticmethod
+    def _collapse_lock_requests(requests):
+        """Keep only maximal covering trees; never acquire a missing child root."""
+        result = []
+        for request in sorted(requests, key=lambda item: (
+            item["path"].rstrip("/").count("/"), item["path"].rstrip("/"),
+            0 if item["kind"] == "tree" else 1,
+        )):
+            path = request["path"].rstrip("/")
+            if any(item["path"] == path or (
+                item["kind"] == "tree" and path.startswith(item["path"] + "/")
+            ) for item in result):
+                continue
+            result.append({"path": path, "kind": request["kind"]})
+        return result
+
+    async def _capture_resource_identity(self, ctx):
+        from openviking.service.account_identity import capture_account_identity
+        manager = getattr(self, "_account_identity_manager", None)
+        if manager is None or not callable(getattr(manager, "get_account_identity", None)):
+            raise FailedPreconditionError("Qualified resources operations require an account identity manager")
+        return await capture_account_identity(manager, self._ctx_or_default(ctx).account_id)
+
+    async def _acquire_resource_coverage(self, ctx, admitted, *, requests=(), owner_lease_ref=None):
+        from openviking.service.account_identity import recheck_account_identity
+        real_ctx = self._ctx_or_default(ctx)
+        root = self._uri_to_path("viking://resources", ctx=real_ctx)
+        lease = await self._async_agfs.pathlock_acquire_batch(
+            self._collapse_lock_requests([{"path": root, "kind": "tree"}, *requests]),
+            owner_lease_ref=owner_lease_ref,
+        )
+        try:
+            # ROOT must satisfy the same authoritative, fresh lifetime check.
+            await recheck_account_identity(self._account_identity_manager, real_ctx.account_id, admitted)
+        except BaseException:
+            await self._async_agfs.pathlock_release(lease)
+            raise
+        return lease
 
     # ========== AGFS Basic Commands ==========
 
@@ -240,7 +284,11 @@ class _OpsMixin:
         unless descendant ACL checks require it. Namespace permission checks
         and path locking still apply.
 
-        When ``auto_pathlock`` is False and no outer ``lease_ref`` is supplied,
+        Shared-resource deletion always requires an authoritative account identity
+        and resources-root Tree coverage, including absent-node index cleanup and
+        ``no_vector`` calls. ``auto_pathlock=False`` cannot bypass that coverage.
+
+        Outside shared resources, when ``auto_pathlock`` is False and no outer ``lease_ref`` is supplied,
         the VikingFS-level tree/exact lease is skipped and the underlying AGFS
         delete runs with automatic pathlock disabled. Callers must guarantee the
         target is not concurrently mutated (e.g. best-effort shared upload
@@ -271,30 +319,32 @@ class _OpsMixin:
                 logger.warning(f"[VikingFS] Failed to count nodes before delete: {e}")
                 return 0
 
-        # Check existence and determine lock strategy
-        try:
-            stat = await self._async_agfs.stat(path)
-            is_dir = stat.get("isDir", False) if isinstance(stat, dict) else False
-        except Exception as exc:
-            if not is_not_found_error(exc):
-                mapped = map_exception(exc, resource=uri)
-                if mapped is not None:
-                    raise mapped from exc
-                raise
-            if recursive:
-                await self._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
-            if no_vector:
-                return {"estimated_deleted_count": 0}
-            # Path does not exist: clean up any orphan index records and return
-            uris_to_delete = await self._collect_uris(path, recursive, ctx=ctx)
-            uris_to_delete.append(target_uri)
-            real_ctx = self._ctx_or_default(ctx)
-            estimated_count = await _estimate_deleted_count(path, real_ctx)
-            await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
-            logger.info(f"[VikingFS] rm target not found, cleaned orphan index: {uri}")
-            return {"estimated_deleted_count": estimated_count}
-
-        if is_dir:
+        resource_scope = self._is_shared_resource_uri(target_uri)
+        admitted = await self._capture_resource_identity(ctx) if resource_scope else None
+        is_dir = False
+        if not resource_scope:
+            try:
+                stat = await self._async_agfs.stat(path)
+                is_dir = stat.get("isDir", False) if isinstance(stat, dict) else False
+            except Exception as exc:
+                if not is_not_found_error(exc):
+                    mapped = map_exception(exc, resource=uri)
+                    if mapped is not None:
+                        raise mapped from exc
+                    raise
+                if recursive:
+                    await self._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
+                if no_vector:
+                    return {"estimated_deleted_count": 0}
+                # Path does not exist: clean up any orphan index records and return
+                uris_to_delete = await self._collect_uris(path, recursive, ctx=ctx)
+                uris_to_delete.append(target_uri)
+                real_ctx = self._ctx_or_default(ctx)
+                estimated_count = await _estimate_deleted_count(path, real_ctx)
+                await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
+                logger.info(f"[VikingFS] rm target not found, cleaned orphan index: {uri}")
+                return {"estimated_deleted_count": estimated_count}
+        if is_dir and not resource_scope:
             await self._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
             if not recursive:
                 raise InvalidArgumentError(
@@ -303,7 +353,8 @@ class _OpsMixin:
                 )
             lock_method = self._async_agfs.pathlock_acquire_tree
         else:
-            recursive = False
+            if not resource_scope:
+                recursive = False
             lock_method = self._async_agfs.pathlock_acquire_exact
 
         # When an outer lease is supplied we always honor it. Otherwise callers
@@ -311,13 +362,40 @@ class _OpsMixin:
         # which case the AGFS delete also runs with automatic pathlock disabled.
         skip_lock = lease_ref is None and not auto_pathlock
         lease = lease_ref
-        if lease is None and not skip_lock:
+        if resource_scope:
+            lease = await self._acquire_resource_coverage(ctx, admitted, owner_lease_ref=lease_ref)
+        elif lease is None and not skip_lock:
             try:
                 lease = await lock_method(path)
             except LockAcquisitionError:
                 raise ResourceBusyError(f"Resource is being processed: {uri}", uri=uri)
 
         try:
+            if resource_scope:
+                await self._ensure_access(uri, guard_ctx, action=AclAction.MANAGE)
+                await self._ensure_access(uri, ctx, action=AclAction.WRITE)
+                try:
+                    fresh = await self._async_agfs.stat(path)
+                    missing = False
+                    is_dir = bool(fresh.get("isDir", False))
+                except Exception as exc:
+                    if not is_not_found_error(exc):
+                        raise
+                    missing, is_dir = True, False
+                if is_dir or (missing and recursive):
+                    await self._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
+                if is_dir and not recursive:
+                    raise InvalidArgumentError(f"Cannot remove directory without --recursive: {uri}")
+                if missing:
+                    count = 0
+                    if not no_vector:
+                        orphan_uris = await self._collect_uris(path, recursive, ctx=ctx)
+                        orphan_uris.append(target_uri)
+                        count = await _estimate_deleted_count(path, self._ctx_or_default(ctx))
+                        await self._delete_from_vector_store(orphan_uris, ctx=ctx)
+                    return {"estimated_deleted_count": count}
+                if not is_dir:
+                    recursive = False
             check_descendant_acl = (
                 is_dir
                 and (not no_vector or is_acl_uri(target_uri))
@@ -366,7 +444,7 @@ class _OpsMixin:
                 result = {"estimated_deleted_count": estimated_count}
             return result
         finally:
-            if lease_ref is None and lease is not None:
+            if (resource_scope or lease_ref is None) and lease is not None:
                 await self._async_agfs.pathlock_release(lease)
 
     async def remove_files(
@@ -535,39 +613,23 @@ class _OpsMixin:
         if bool(stat.get("isDir", False)) != is_dir:
             raise InvalidArgumentError(f"transfer source and target types differ: {uri}")
 
-    async def _ensure_transfer_destination_absent(
-        self,
-        path: str,
-        uri: str,
-        *,
-        allow_lock_placeholder: bool = False,
-    ) -> None:
-        """Raise ``ConflictError`` unless no file or directory exists at ``path``.
-
-        ``allow_lock_placeholder`` is for the recheck under a Tree lease: with the
-        filesystem lock provider, acquiring a Tree lock on a missing path creates
-        that directory to hold ``.path.ovlock``. Such a directory has no visible
-        entries. Callers pass it only after an unlocked check already saw the path
-        absent, so a directory that existed before the move is always refused,
-        even when empty, and one that holds any visible entry is refused too.
-        """
+    async def _mkdir_transfer_root_exclusive(self, path, uri, ctx, lease):
+        """Only successful exclusive creation establishes ownership."""
         try:
-            stat = await self._async_agfs.stat(path)
+            await self._async_agfs.mkdir(path, fs_ctx=self._pathlock_fs_ctx(ctx, lease))
+        except Exception as exc:
+            if isinstance(exc, AGFSAlreadyExistsError) or "exist" in str(exc).lower():
+                raise ConflictError(f"Transfer destination already exists: {uri}", resource=uri) from exc
+            raise
+
+    async def _ensure_transfer_destination_absent(self, path: str, uri: str) -> None:
+        """An existing empty directory is occupied, regardless of lock history."""
+        try:
+            await self._async_agfs.stat(path)
         except Exception as exc:
             if is_not_found_error(exc):
                 return
-            mapped = map_exception(exc, resource=uri)
-            if mapped is not None:
-                raise mapped from exc
             raise
-        if allow_lock_placeholder and isinstance(stat, dict) and stat.get("isDir", False):
-            entries = await self._async_agfs.ls(path)
-            if not any(
-                (name := entry.get("name", "")) not in ("", ".", "..")
-                and not is_storage_internal_name(name)
-                for entry in entries
-            ):
-                return
         raise ConflictError(f"Transfer destination already exists: {uri}", resource=uri)
 
     async def _prepare_transfer_entries(
@@ -784,6 +846,10 @@ class _OpsMixin:
         self._validate_transfer_paths(old_path, new_path)
         new_acl_scope = acl_enabled and is_acl_uri(new_uri)
 
+        resource_scope = no_replace and (
+            self._is_shared_resource_uri(old_uri) or self._is_shared_resource_uri(new_uri)
+        )
+        admitted = await self._capture_resource_identity(ctx) if resource_scope else None
         # Verify source exists and determine type before locking.
         try:
             stat = await self._async_agfs.stat(old_path)
@@ -824,9 +890,23 @@ class _OpsMixin:
                         details={"from_uri": old_uri, "to_uri": new_uri},
                     )
 
-        if is_dir:
+        if resource_scope:
+            requests = [
+                {"path": old_path.rsplit("/", 1)[0], "kind": "tree"},
+                {"path": new_path.rsplit("/", 1)[0], "kind": "tree"},
+            ]
+            lease = await self._acquire_resource_coverage(
+                ctx, admitted, requests=requests, owner_lease_ref=lease_ref,
+            )
+        elif is_dir:
+            requests = self._directory_transfer_lock_requests(old_path, new_path)
+            if no_replace:
+                requests = self._collapse_lock_requests([
+                    {"path": old_path, "kind": "tree"},
+                    {"path": new_path.rsplit("/", 1)[0], "kind": "tree"},
+                ])
             lease = await self._async_agfs.pathlock_acquire_batch(
-                self._directory_transfer_lock_requests(old_path, new_path),
+                requests,
                 owner_lease_ref=lease_ref,
             )
         else:
@@ -856,13 +936,17 @@ class _OpsMixin:
                     f"Move source type changed during acquisition: {old_uri}",
                     resource=old_uri,
                 )
+            await self._ensure_access(old_uri, ctx, action=AclAction.WRITE)
+            await self._ensure_access(new_uri, ctx, action=AclAction.WRITE)
+            await self._ensure_transfer_parent_directory(new_path, new_uri, operation="mv")
             if no_replace:
-                await self._ensure_transfer_destination_absent(
-                    new_path, new_uri, allow_lock_placeholder=is_dir
-                )
+                await self._ensure_transfer_destination_absent(new_path, new_uri)
             uris_to_move = await self._prepare_transfer_entries(
                 old_uri, new_uri, is_dir=is_dir, move=True, ctx=ctx
             )
+
+            if no_replace and is_dir:
+                await self._mkdir_transfer_root_exclusive(new_path, new_uri, ctx, lease)
 
             # Check if it's temp directory (files already encrypted)
             is_temp = old_uri.startswith("viking://temp/")

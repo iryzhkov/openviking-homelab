@@ -10,7 +10,7 @@ Guarantee, stated exactly:
 
 * Preconditions (tree revisions of target and staging, absent backup) are
   checked under the lease, before the first change. A mismatch returns 409
-  and changes nothing except removing lock placeholders this call created.
+  and changes no target, staging or backup content.
 * While the lease is held, no backend writer that takes RAGFS path locks can
   change any of the three trees. Writers that bypass path locks, including
   direct disk writers, are not covered.
@@ -336,19 +336,26 @@ async def tree_revision(
     uri = VikingFS._normalize_transfer_uri(uri).rstrip("/")
     await viking_fs._ensure_access(uri, ctx, action=AclAction.READ)
     path = viking_fs._uri_to_path(uri, ctx=ctx)
+    resource_scope = viking_fs._is_shared_resource_uri(uri)
+    admitted = await viking_fs._capture_resource_identity(ctx) if resource_scope else None
     try:
-        await viking_fs._async_agfs.stat(path)
-    except Exception as exc:
-        if is_not_found_error(exc):
-            # Locking a missing path would create it; report absence without a lease.
-            return {"uri": uri, "revision": ABSENT_REVISION, **_summary(None)}
-        raise
-    try:
-        lease = await viking_fs._async_agfs.pathlock_acquire_tree(path)
+        if resource_scope:
+            lease = await viking_fs._acquire_resource_coverage(ctx, admitted)
+        else:
+            # Preserve non-resource behavior, without creating an absent target.
+            try:
+                await viking_fs._async_agfs.stat(path)
+            except Exception as exc:
+                if is_not_found_error(exc):
+                    return {"uri": uri, "revision": ABSENT_REVISION, **_summary(None)}
+                raise
+            lease = await viking_fs._async_agfs.pathlock_acquire_tree(path)
     except LockAcquisitionError as exc:
         raise ResourceBusyError(f"tree is busy: {uri}", uri=uri) from exc
     try:
         await viking_fs._ensure_access(uri, ctx, action=AclAction.READ)
+        if resource_scope and uri != "viking://resources":
+            await viking_fs._ensure_transfer_parent_directory(path, uri, operation="revision")
         entries = await _tree_entries(
             viking_fs, path, viking_fs._pathlock_fs_ctx(ctx, lease), ctx=ctx
         )
@@ -398,38 +405,15 @@ async def replace_tree(
     await viking_fs._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
     await viking_fs._ensure_access(staging_uri, ctx, action=AclAction.MANAGE)
     await viking_fs._ensure_access(backup_uri, ctx, action=AclAction.WRITE)
-    for path, uri in zip(paths, uris):
-        await viking_fs._ensure_transfer_parent_directory(path, uri, operation="replace")
-
-    async def exists(path: str) -> bool:
-        try:
-            await viking_fs._async_agfs.stat(path)
-        except Exception as exc:
-            if is_not_found_error(exc):
-                return False
-            raise
-        return True
-
-    # Unlocked observations decide which empty directories our own locks create.
-    target_existed = await exists(target_path)
-    if await exists(backup_path):
-        raise _conflict("backup destination already exists", uri=backup_uri)
-    if not await exists(staging_path):
-        raise _conflict("staging tree no longer exists", uri=staging_uri)
-
+    admitted = await viking_fs._capture_resource_identity(ctx)
     try:
-        lease = await viking_fs._async_agfs.pathlock_acquire_tree_batch(paths)
+        lease = await viking_fs._acquire_resource_coverage(ctx, admitted)
     except LockAcquisitionError as exc:
         raise ResourceBusyError(f"tree is busy: {target_uri}", uri=target_uri) from exc
     fs_ctx = viking_fs._pathlock_fs_ctx(ctx, lease)
 
     async def read(path: str) -> List[Dict[str, Any]] | None:
         return await _tree_entries(viking_fs, path, fs_ctx, ctx=ctx)
-
-    async def remove_placeholder(path: str) -> None:
-        entries = await read(path)
-        if entries == []:
-            await viking_fs._async_agfs.rm(path, recursive=True, fs_ctx=fs_ctx)
 
     async def step(name: str) -> None:
         if fault is not None:
@@ -442,6 +426,8 @@ async def replace_tree(
         "content_committed": False,
     }
     try:
+        for path, uri in zip(paths, uris):
+            await viking_fs._ensure_transfer_parent_directory(path, uri, operation="replace")
         # -- preconditions under the lease, before any change --------------
         await viking_fs._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
         await viking_fs._ensure_access(staging_uri, ctx, action=AclAction.MANAGE)
@@ -449,8 +435,6 @@ async def replace_tree(
         staging_entries = await read(staging_path)
         staging_revision = revision_of(staging_entries)
         target_entries = await read(target_path)
-        if target_entries == [] and not target_existed:
-            target_entries = None  # our Tree lock created it
         target_revision = revision_of(target_entries)
         backup_entries = await read(backup_path)
         problems = {}
@@ -458,12 +442,9 @@ async def replace_tree(
             problems["staging"] = staging_revision
         if target_revision != expected_target_revision:
             problems["target"] = target_revision
-        if backup_entries:
+        if backup_entries is not None:
             problems["backup"] = "occupied"
         if problems:
-            if not target_existed:
-                await remove_placeholder(target_path)
-            await remove_placeholder(backup_path)
             raise _conflict(
                 "tree replacement precondition failed",
                 target_uri=target_uri,
@@ -514,9 +495,16 @@ async def replace_tree(
 
         # -- 1. copy the old tree to the backup and verify it --------------
         backup_verified = False
+        # mkdir is exclusive: an empty contender directory is foreign, not ours.
+        # No transaction mutation has begun if this fails.
+        if target_entries is not None:
+            await viking_fs._mkdir_transfer_root_exclusive(backup_path, backup_uri, ctx, lease)
+        if target_entries is None:
+            await viking_fs._mkdir_transfer_root_exclusive(target_path, target_uri, ctx, lease)
+        target_owned = target_entries is None
         try:
             await step("backup")
-            if target_entries:
+            if target_entries is not None:
                 await transfer_skill_package(
                     viking_fs, target_uri, backup_uri, ctx=ctx, lease_ref=lease,
                     preserve_sidecar_bytes=True,
@@ -530,13 +518,11 @@ async def replace_tree(
                 raise RuntimeError("backup copy does not match the target revision")
             # -- 2. clear the target, install staging, verify --------------
             await step("clear_target")
-            if target_entries:
+            if target_entries is not None:
                 await clear_skill_package_contents(
                     viking_fs, target_uri, ctx=ctx, lease_ref=lease,
                     preserve_index=True,
                 )
-            elif await read(target_path) is None:
-                await viking_fs._async_agfs.mkdir(target_path, fs_ctx=fs_ctx)
             await step("install")
             await transfer_skill_package(
                 viking_fs, staging_uri, target_uri, ctx=ctx, lease_ref=lease,
@@ -562,6 +548,7 @@ async def replace_tree(
                 fs_ctx=fs_ctx,
                 original_records=original_records,
                 backup_revision=expected_backup,
+                target_owned=target_owned,
             )
             raise AssertionError("unreachable")  # _recover always raises
         state["content_committed"] = True
@@ -576,9 +563,8 @@ async def replace_tree(
                 await _finish_context_copy(viking_fs, staging_uri, [], ctx)
             else:
                 cleanup["retained"].append(staging_uri)
-            if not target_entries:
-                # Nothing was backed up; drop the directory our Tree lock created.
-                await remove_placeholder(backup_path)
+            if target_entries is None:
+                pass  # No backup root was created.
             elif retain_backup:
                 cleanup["retained"].append(backup_uri)
             elif revision_of(await read(backup_path)) == expected_backup:
@@ -617,6 +603,7 @@ async def _recover(
     fs_ctx: Dict[str, Any] | None,
     original_records: List[Dict[str, Any]] | None = None,
     backup_revision: str | None = None,
+    target_owned: bool = False,
 ) -> None:
     """Restore the old tree from the verified backup, never deleting a copy blindly."""
     target_path, staging_path, backup_path = paths
@@ -635,9 +622,7 @@ async def _recover(
     if current == "unknown":
         details["state"] = "rollback_unavailable"
         details["observation_failure"] = "target_unreadable"
-    elif current == previous or (
-        previous == ABSENT_REVISION and current in (ABSENT_REVISION, revision_of([]))
-    ):
+    elif current == previous:
         # The target files were never changed; any backup is only a copy. The
         # backup transfer may already have moved the target's vector records.
         details["state"] = "target_unchanged"
@@ -649,22 +634,21 @@ async def _recover(
                 await viking_fs._update_vector_store_uris(
                     backup_uri, target_uri, recursive=True, ctx=ctx
                 )
-            elif backup_entries == []:
-                await viking_fs._async_agfs.rm(backup_path, recursive=True, fs_ctx=fs_ctx)
-            if previous == ABSENT_REVISION and current == revision_of([]):
-                await viking_fs._async_agfs.rm(target_path, recursive=True, fs_ctx=fs_ctx)
         except Exception as exc:
             logger.warning("Tree replacement index restore failed for %s", target_uri, exc_info=True)
             details["index_restore_failure"] = type(exc).__name__
-    elif backup_verified or target_entries is None:
+    elif backup_verified or (target_entries is None and target_owned):
         try:
             if previous == ABSENT_REVISION:
+                if not target_owned:
+                    raise RuntimeError("cannot remove an unowned target root")
                 await clear_skill_package_contents(
                     viking_fs, target_uri, ctx=ctx, lease_ref=lease,
                     **({"preserve_index": True} if original_records is not None else {}),
                 )
                 if original_records is not None:
                     await _finish_context_copy(viking_fs, target_uri, [], ctx)
+                await viking_fs._async_agfs.rm(target_path, recursive=True, fs_ctx=fs_ctx)
             else:
                 if revision_of(await read(backup_path)) != (backup_revision or previous):
                     raise RuntimeError("backup changed before restoration")
@@ -686,10 +670,7 @@ async def _recover(
                 if restored_records is not None:
                     await _finish_context_copy(viking_fs, target_uri, restored_records, ctx)
             restored = revision_of(await read(target_path))
-            accepted = (
-                (ABSENT_REVISION, revision_of([])) if previous == ABSENT_REVISION else (previous,)
-            )
-            if restored not in accepted:
+            if restored != previous:
                 raise RuntimeError("restored target does not match its previous revision")
             details["state"] = "rolled_back"
         except Exception as exc:

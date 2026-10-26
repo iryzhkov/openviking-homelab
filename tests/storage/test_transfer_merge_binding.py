@@ -12,6 +12,7 @@ import pytest_asyncio
 from openviking.pyagfs import get_binding_client
 from openviking.resource.watch_manager import WatchManager
 from openviking.server.identity import RequestContext, Role
+from openviking.server.api_keys.legacy import FileStore
 from openviking.storage.acl import AclAction, AclManager
 from openviking.storage.collection_schemas import CollectionSchemas
 from openviking.storage.vector_ids import vector_record_id
@@ -59,7 +60,13 @@ async def indexed_fs(vector_backend_factory, binding_fs, tmp_path):
             "context", CollectionSchemas.context_collection("context", 4)
         )
         binding_fs.vector_store = backend
-        yield binding_fs, backend
+        identity_manager = FileStore(binding_fs, watch_enabled=False)
+        await identity_manager.load()
+        binding_fs.set_account_identity_manager(identity_manager)
+        try:
+            yield binding_fs, backend
+        finally:
+            await identity_manager.close()
     finally:
         await backend.close()
 
