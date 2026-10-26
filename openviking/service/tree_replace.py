@@ -96,12 +96,27 @@ def _controls(record: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+async def _require_tree_access(viking_fs, uri, uris, ctx, action):
+    """Refuse a whole tree without naming any ACL-hidden descendant."""
+    try:
+        await viking_fs._ensure_access_many(
+            list(dict.fromkeys([uri, *uris])), ctx, action=action
+        )
+    except PermissionDeniedError:
+        raise PermissionDeniedError(
+            "Tree contains inaccessible entries", resource=uri
+        ) from None
+
+
 async def _context_records(viking_fs, uri, ctx):
     store = viking_fs._get_vector_store()
     if store is None:
         return []
     records, _ = await store._scan_uri_transfer_scope(
         replace(ctx, bypass_acl=True), uri, recursive=True, include_full_records=True
+    )
+    await _require_tree_access(
+        viking_fs, uri, [record["uri"] for record in records], ctx, AclAction.READ
     )
     if len(records) > MAX_TREE_ENTRIES * 3:
         raise ResourceExhaustedError("too many context records for guarded replacement")
@@ -199,6 +214,9 @@ async def _tree_entries(
     tokens are excluded, so a directory created by a Tree lock reads as empty.
     """
     agfs = viking_fs._async_agfs
+    real_ctx = viking_fs._ctx_or_default(ctx)
+    uri = viking_fs._path_to_uri(path, ctx=real_ctx).rstrip("/")
+    await _require_tree_access(viking_fs, uri, [], real_ctx, AclAction.READ)
     try:
         stat = await agfs.stat(path)
     except Exception as exc:
@@ -219,6 +237,9 @@ async def _tree_entries(
                 continue
             relative = f"{prefix}{name}"
             child = f"{directory.rstrip('/')}/{name}"
+            await _require_tree_access(
+                viking_fs, uri, [f"{uri}/{relative}"], real_ctx, AclAction.READ
+            )
             if len(entries) >= MAX_TREE_ENTRIES:
                 raise ResourceExhaustedError(
                     "tree is too large for a guarded replacement",
@@ -246,8 +267,6 @@ async def _tree_entries(
             )
 
     await visit(path, "")
-    real_ctx = viking_fs._ctx_or_default(ctx)
-    uri = viking_fs._path_to_uri(path, ctx=real_ctx).rstrip("/")
     records = await _context_records(viking_fs, uri, real_ctx)
     return _with_metadata(entries, records, uri)
 
@@ -437,6 +456,23 @@ async def replace_tree(
         target_entries = await read(target_path)
         target_revision = revision_of(target_entries)
         backup_entries = await read(backup_path)
+        original_records = await _context_records(viking_fs, target_uri, ctx)
+        staging_records = await _context_records(viking_fs, staging_uri, ctx)
+        # Authorize physical and context-only entries before revealing any
+        # revision in a precondition conflict, not merely before mutation.
+        for root, entries, records in (
+            (target_uri, target_entries, original_records),
+            (staging_uri, staging_entries, staging_records),
+        ):
+            await _require_tree_access(
+                viking_fs,
+                root,
+                [f"{root}/{entry['path']}" for entry in entries or []
+                 if entry["type"] in {"file", "dir"}]
+                + [record["uri"] for record in records],
+                ctx,
+                AclAction.MANAGE,
+            )
         problems = {}
         if staging_revision != expected_staging_revision:
             problems["staging"] = staging_revision
@@ -450,14 +486,6 @@ async def replace_tree(
                 target_uri=target_uri,
                 current_revisions=problems,
             )
-        original_records = await _context_records(viking_fs, target_uri, ctx)
-        staging_records = await _context_records(viking_fs, staging_uri, ctx)
-        # Context-only/orphan entries also have user policies; filesystem-only
-        # traversal cannot authorize their mutation.
-        await viking_fs._ensure_access_many(
-            [record["uri"] for record in original_records + staging_records],
-            ctx, action=AclAction.MANAGE,
-        )
         # If staging lacks a tagged/direct-policy record at a retained entry,
         # there is no qualified metadata-only record representation here.
         incoming = {(record["uri"][len(staging_uri):], record.get("level", 2))
