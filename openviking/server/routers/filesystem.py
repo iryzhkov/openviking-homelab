@@ -5,7 +5,7 @@
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from openviking.core.namespace import context_type_for_uri
 from openviking.core.namespace_policy import namespace_policy_for_uri
@@ -351,6 +351,25 @@ class MvRequest(BaseModel):
     no_replace: bool = False
 
 
+class ReplaceTreeRequest(BaseModel):
+    """Replace one directory below viking://resources by a prepared staging directory.
+
+    Revisions come from GET /api/v1/fs/tree-revision; use "absent" for a target
+    that must not exist yet. The backup must not exist. All conditions are checked
+    under one lease over the three trees before any change; a mismatch returns 409.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_uri: str
+    staging_uri: str
+    backup_uri: str
+    expected_target_revision: str
+    expected_staging_revision: str
+    # Keep the verified copy of the old tree after a successful replacement.
+    retain_backup: bool = True
+
+
 class CpRequest(BaseModel):
     """Request model for cp."""
 
@@ -432,4 +451,51 @@ async def mv(
     result: dict[str, object] = {"from": from_uri, "to": to_uri}
     if request.no_replace:
         result["no_replace"] = True
+    return Response(status="ok", result=result)
+
+
+@router.get("/tree-revision")
+async def tree_revision(
+    uri: str = Query(..., description="Viking URI of a directory"),
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Return a directory's revision: names, types, sizes and bytes of every entry."""
+    service = get_service()
+    uri = validate_request_viking_uri(resolve_path_variables(uri), _ctx)
+    try:
+        result = await service.fs.tree_revision(uri, ctx=_ctx)
+    except Exception as exc:
+        mapped = map_exception(exc, resource=uri)
+        if mapped is not None:
+            raise mapped from exc
+        raise
+    return Response(status="ok", result=result)
+
+
+@router.post("/replace-tree")
+async def replace_tree(
+    request: ReplaceTreeRequest,
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Replace a resource directory under one lease; see ReplaceTreeRequest."""
+    service = get_service()
+    uris = {
+        field: validate_request_viking_uri(
+            resolve_path_variables(getattr(request, field)), _ctx, field_name=field
+        )
+        for field in ("target_uri", "staging_uri", "backup_uri")
+    }
+    try:
+        result = await service.fs.replace_tree(
+            **uris,
+            expected_target_revision=request.expected_target_revision,
+            expected_staging_revision=request.expected_staging_revision,
+            retain_backup=request.retain_backup,
+            ctx=_ctx,
+        )
+    except Exception as exc:
+        mapped = map_exception(exc, resource=uris["target_uri"])
+        if mapped is not None:
+            raise mapped from exc
+        raise
     return Response(status="ok", result=result)

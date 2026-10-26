@@ -33,6 +33,7 @@ from openviking.privacy.skill_restore import get_skill_name_from_uri, restore_sk
 from openviking.resource.uri_mutation_coordinator import UriMutationCoordinator
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
+from openviking.service import tree_replace
 from openviking.service.task_tracker import get_task_tracker, run_tracked_operation
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.service.task_work_index import get_enqueued_work_ids, get_task_context
@@ -1072,6 +1073,51 @@ class FSService:
             self._mv_and_refresh(from_uri, to_uri, ctx=ctx, no_replace=no_replace),
             operation="move",
         )
+
+    async def tree_revision(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
+        """Return a directory's tree revision, read under a Tree lease."""
+        return await tree_replace.tree_revision(self._ensure_initialized(), uri, ctx=ctx)
+
+    async def replace_tree(
+        self,
+        *,
+        target_uri: str,
+        staging_uri: str,
+        backup_uri: str,
+        expected_target_revision: str,
+        expected_staging_revision: str,
+        retain_backup: bool = True,
+        ctx: RequestContext,
+    ) -> Dict[str, Any]:
+        """Replace one resource directory by a prepared staging directory.
+
+        See ``openviking.service.tree_replace`` for the exact guarantee. The
+        transaction finishes even if the caller disconnects.
+        """
+        uris = [
+            VikingFS._normalize_transfer_uri(uri).rstrip("/")
+            for uri in (target_uri, staging_uri, backup_uri)
+        ]
+        for uri in uris:
+            self._reject_storage_internal_target(uri)
+            if is_watch_task_control_uri(uri):
+                raise PermissionDeniedError("watch-task control state cannot be replaced", resource=uri)
+        viking_fs = self._ensure_initialized()
+
+        async def run() -> Dict[str, Any]:
+            async with self._uri_mutation_coordinator.mutation(ctx.account_id, uris):
+                return await tree_replace.replace_tree(
+                    viking_fs,
+                    target_uri=uris[0],
+                    staging_uri=uris[1],
+                    backup_uri=uris[2],
+                    expected_target_revision=expected_target_revision,
+                    expected_staging_revision=expected_staging_revision,
+                    retain_backup=retain_backup,
+                    ctx=ctx,
+                )
+
+        return await self._finish_transfer_after_caller_cancel(run(), operation="replace")
 
     async def _mv_and_refresh(
         self,
