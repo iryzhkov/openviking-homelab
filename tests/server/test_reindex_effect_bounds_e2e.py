@@ -267,20 +267,67 @@ async def test_entire_plan_validated_before_capture_even_after_good_first_action
     admitted_service, monkeypatch, persisted
 ):
     import openviking.storage.context_update_plan as planning
+    import openviking.storage.queuefs.resource_embedding_fence as fence
+    import openviking.storage.resource_rfv as rfv
+    from openviking.storage.vector_ids import vector_record_id
+    from openviking.utils.resource_processor import ResourceProcessor
 
     service = admitted_service
     monkeypatch.setattr("openviking.server.dependencies._service", service)
-    root, _ = await _seed(service)
+    root, uri = await _seed(service)
     original = planning.build_rfv_context_update_plan
+    original_validate = rfv.validate_resource_reindex_plan
+    original_capture = fence.capture_resource_index_conditions
+    original_enqueue = ResourceProcessor._enqueue_index_actions
+    constructed = []
+    validated = []
+    rejected = []
+    capture_calls = []
+    enqueue_calls = []
 
     def poisoned(**kwargs):
         diff, plan = original(**kwargs)
         good = plan.direct_index_actions[0]
-        bad = replace(good, uri=root + "-foreign/item.md")
-        return diff, replace(plan, direct_index_actions=(*plan.direct_index_actions, bad))
+        assert good.uri == uri
+        bad_uri = root + "/%2e%2e/out.md"
+        bad = replace(
+            good,
+            uri=bad_uri,
+            record_id=vector_record_id(_root_ctx().account_id, bad_uri, good.level),
+        )
+        assert bad.record_id != good.record_id
+        # Lexically in-root and distinct IDs pass the ORIGINAL constructor.
+        poisoned_plan = replace(plan, direct_index_actions=(*plan.direct_index_actions, bad))
+        assert poisoned_plan.direct_index_actions[0] is good
+        assert poisoned_plan.direct_index_actions[-1] is bad
+        constructed.append(poisoned_plan)
+        return diff, poisoned_plan
+
+    def validate(viking_fs, snapshot, plan, ctx):
+        assert constructed and plan is constructed[-1]
+        validated.append(plan)
+        try:
+            return original_validate(viking_fs, snapshot, plan, ctx)
+        except ValueError as exc:
+            rejected.append(str(exc))
+            raise
+
+    async def capture(*args, **kwargs):
+        capture_calls.append(args)
+        return await original_capture(*args, **kwargs)
+
+    async def enqueue(self, actions, **kwargs):
+        enqueue_calls.append(actions)
+        return await original_enqueue(self, actions, **kwargs)
 
     monkeypatch.setattr(planning, "build_rfv_context_update_plan", poisoned)
-    effects = _effect_recorder(monkeypatch)
+    monkeypatch.setattr(rfv, "validate_resource_reindex_plan", validate)
+    monkeypatch.setattr(fence, "capture_resource_index_conditions", capture)
+    monkeypatch.setattr(ResourceProcessor, "_enqueue_index_actions", enqueue)
     with pytest.raises(Exception, match="canonical"):
         await _run(service, root)
-    assert not effects and not [data for name, data in persisted if "mbedding" in name]
+    assert len(constructed) == len(validated) == 1
+    assert rejected == ["Resource reindex requires canonical in-target URIs"]
+    assert not capture_calls
+    assert not enqueue_calls
+    assert not [data for name, data in persisted if "mbedding" in name]
