@@ -6,8 +6,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import tempfile
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,7 +23,12 @@ from openviking.storage.ovpack.operations import (
     import_ovpack,
     restore_ovpack,
 )
-from openviking_cli.exceptions import InvalidArgumentError, NotFoundError, PermissionDeniedError
+from openviking_cli.exceptions import (
+    FailedPreconditionError,
+    InvalidArgumentError,
+    NotFoundError,
+    PermissionDeniedError,
+)
 from openviking_cli.session.user_id import UserIdentifier
 from tests.storage.test_transfer_merge_binding import binding_fs as binding_fs
 from tests.storage.test_transfer_merge_binding import indexed_fs as indexed_fs
@@ -416,14 +419,10 @@ def request_ctx() -> RequestContext:
 
 
 @pytest.fixture
-def temp_ovpack_path() -> Path:
-    fd, path = tempfile.mkstemp(suffix=".ovpack")
-    os.close(fd)
-    ovpack_path = Path(path)
-    try:
-        yield ovpack_path
-    finally:
-        ovpack_path.unlink(missing_ok=True)
+def temp_ovpack_path(tmp_path: Path) -> Path:
+    ovpack_path = tmp_path / "fixture.ovpack"
+    ovpack_path.touch()
+    return ovpack_path
 
 
 def _write_ovpack(path: Path, entries: dict[str, str]) -> None:
@@ -848,7 +847,7 @@ async def test_export_include_vectors_allows_overview_without_abstract(
 
 
 @pytest.mark.asyncio
-async def test_ovpack_roundtrips_dot_and_escaped_looking_user_paths(
+async def test_ovpack_preserves_dot_paths_and_refuses_unqualified_resource_import(
     temp_ovpack_path: Path,
     request_ctx: RequestContext,
     monkeypatch: pytest.MonkeyPatch,
@@ -879,13 +878,10 @@ async def test_ovpack_roundtrips_dot_and_escaped_looking_user_paths(
     assert {".ovpack", ".ovpack/foo.txt", ".notes.txt", "_._notes.txt"} <= manifest_paths
 
     fake_fs = FakeVikingFS()
-    await import_ovpack(fake_fs, str(temp_ovpack_path), "viking://resources/imported", request_ctx)
-
-    assert fake_fs.written_files == [
-        "viking://resources/imported/demo/.ovpack/foo.txt",
-        "viking://resources/imported/demo/.notes.txt",
-        "viking://resources/imported/demo/_._notes.txt",
-    ]
+    with pytest.raises(FailedPreconditionError, match="qualified native account coverage"):
+        await import_ovpack(fake_fs, str(temp_ovpack_path), "viking://resources/imported", request_ctx)
+    assert fake_fs.written_files == []
+    assert fake_fs.created_dirs == []
 
 
 @pytest.mark.asyncio
@@ -911,7 +907,7 @@ async def test_export_include_vectors_rejects_hybrid_index_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_import_ovpack_restores_required_dense_vector_snapshot(
+async def test_dense_resource_import_requires_qualified_native_account_coverage(
     temp_ovpack_path: Path, request_ctx: RequestContext, monkeypatch: pytest.MonkeyPatch
 ):
     embedding_metadata = {
@@ -945,29 +941,21 @@ async def test_import_ovpack_restores_required_dense_vector_snapshot(
 
     fake_fs = FakeVikingFS()
     vector_store = FakeVectorStore()
-    result = await import_ovpack(
-        fake_fs,
-        str(temp_ovpack_path),
-        "viking://resources/imported",
-        request_ctx,
-        vector_mode="require",
-        vector_store=vector_store,
-        vector_config_resolver=vector_store,
-    )
-
-    assert result == "viking://resources/imported/demo"
-    assert fake_fs.tree_calls == []
-    assert len(vector_store.upserts) == 3
-    note_record = next(
-        record
-        for record in vector_store.upserts
-        if record["uri"] == "viking://resources/imported/demo/notes.txt"
-    )
-    assert note_record["vector"] == pytest.approx([0.1, 0.2, 0.3])
-    assert note_record["tags"] == ["snapshot"]
-    assert note_record["created_at"]
-    assert note_record["updated_at"]
-    assert note_record["active_count"] == 0
+    with pytest.raises(FailedPreconditionError, match="qualified native account coverage"):
+        await import_ovpack(
+            fake_fs,
+            str(temp_ovpack_path),
+            "viking://resources/imported",
+            request_ctx,
+            vector_mode="require",
+            vector_store=vector_store,
+            vector_config_resolver=vector_store,
+        )
+    assert fake_fs.written_files == []
+    assert fake_fs.created_dirs == []
+    assert vector_store.upserts == []
+    # Real native dense restore and metadata/ACL retention are qualified in
+    # tests/storage/test_ovpack_resource_fence.py.
 
 
 @pytest.mark.asyncio
@@ -1140,9 +1128,10 @@ async def test_import_top_level_scope_package_requires_root_target(
     with pytest.raises(InvalidArgumentError, match=r"must be imported to viking://"):
         await import_ovpack(fake_fs, str(temp_ovpack_path), "viking://resources", request_ctx)
 
-    assert await import_ovpack(fake_fs, str(temp_ovpack_path), "viking://", request_ctx) == (
-        "viking://resources"
-    )
+    with pytest.raises(FailedPreconditionError, match="qualified native account coverage"):
+        await import_ovpack(fake_fs, str(temp_ovpack_path), "viking://", request_ctx)
+    assert fake_fs.written_files == []
+    assert fake_fs.created_dirs == []
 
     _write_ovpack_with_manifest(
         temp_ovpack_path,
@@ -1156,7 +1145,7 @@ async def test_import_top_level_scope_package_requires_root_target(
         )
 
 
-async def _restricted_pack_source(indexed_fs):
+async def _restricted_pack_source(indexed_fs):  # noqa: F811
     fs, backend = indexed_fs
     admin = RequestContext(user=UserIdentifier("acct", "admin"), role=Role.ADMIN)
     reader = RequestContext(user=UserIdentifier("acct", "reader"), role=Role.USER)
@@ -1194,7 +1183,7 @@ async def _restricted_pack_source(indexed_fs):
 
 @pytest.mark.asyncio
 async def test_account_backup_includes_restricted_originals_without_crossing_accounts(
-    indexed_fs, tmp_path
+    indexed_fs, tmp_path  # noqa: F811
 ):
     fs, admin, reader, outsider, original = await _restricted_pack_source(indexed_fs)
     peer_uri = "viking://user/reader/memories/notes.md"
@@ -1225,7 +1214,7 @@ async def test_account_backup_includes_restricted_originals_without_crossing_acc
 
 @pytest.mark.asyncio
 async def test_account_restore_overwrites_original_beneath_existing_restricted_root(
-    indexed_fs, tmp_path, monkeypatch
+    indexed_fs, tmp_path, monkeypatch  # noqa: F811
 ):
     fs, admin, reader, outsider, original = await _restricted_pack_source(indexed_fs)
     archive = tmp_path / "account.ovpack"

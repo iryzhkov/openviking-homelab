@@ -310,6 +310,16 @@ async def import_ovpack(
         index_records = validate_manifest_content(zf, manifest, infolist, base_name)
         dense_vectors = read_dense_vectors(zf, manifest, base_name, index_records)
 
+        if root_uri == "viking://resources" or root_uri.startswith("viking://resources/"):
+            from openviking.storage.ovpack.resource_import import import_resource_pack
+
+            return await import_resource_pack(
+                viking_fs, zf, root_uri=root_uri, members=members, manifest=manifest,
+                index_records=index_records, dense_vectors=dense_vectors,
+                conflict_action=conflict_action, vector_mode=vector_action_mode,
+                vector_store=vector_store, vector_config_resolver=vector_config_resolver, ctx=ctx,
+            )
+
         existing_roots = [root_uri] if await _root_exists(viking_fs, root_uri, ctx) else []
         if existing_roots:
             if conflict_action == "skip":
