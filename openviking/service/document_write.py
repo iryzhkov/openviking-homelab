@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Annotated, Literal
 from uuid import uuid4
 
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
 from openviking.core.context import Context, ContextLevel
 from openviking.parse.accessors.base import LocalResource, SourceType
 from openviking.parse.output import (
@@ -24,6 +26,7 @@ from openviking.parse.output import (
     resolve_artifact_doc_root,
 )
 from openviking.server.error_mapping import is_not_found_error
+from openviking.service import tree_replace
 from openviking.service.account_identity import recheck_account_identity
 from openviking.storage.acl import AclAction, AclMode
 from openviking.storage.context_update_plan import (
@@ -50,9 +53,6 @@ from openviking_cli.exceptions import (
     ResourceExhaustedError,
 )
 from openviking_cli.utils.config import get_openviking_config
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-
-from openviking.service import tree_replace
 
 MAX_TEXT_BYTES = 1024 * 1024
 MAX_REASON_BYTES = 4096
@@ -332,11 +332,14 @@ async def _target_records(fs, uri, inventory, old, root_is_file, ctx):
     if fs.acl_manager is None:
         raise FailedPreconditionError("Document ACL manager unavailable")
     _, records = await fs.acl_manager.prepare_subtree_records(uri, records, ctx)
-    return records
+    backend = await fs._get_vector_store()._get_backend_for_context(ctx)
+    return await backend._async_adapter.run(backend._prepare_upsert_payloads, records)
 
 
 async def _publish_records(fs, uri, records, ctx):
     store = fs._get_vector_store()
+    backend = await store._get_backend_for_context(ctx)
+    records = await backend._async_adapter.run(backend._prepare_upsert_payloads, records)
     if records:
         ids = await store._upsert_many_raw(records, ctx=ctx)
         if len(ids) != len(records):
@@ -486,6 +489,7 @@ async def _write_document(service, request, ctx, *, fault):
         await _live(fs, ctx, admitted, lease)
         if fault is not None:
             await fault(phase)
+        await _live(fs, ctx, admitted, lease)
 
     try:
         async with service.fs._uri_mutation_coordinator.mutation(ctx.account_id, uris):

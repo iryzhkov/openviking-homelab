@@ -5,6 +5,8 @@
 from typing import Any, Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
 from openviking.core.path_variables import resolve_path_variables
 from openviking.core.uri_validation import validate_content_target_uri
 from openviking.resource.processing_mode import DEFAULT_PROCESSING_MODE, ProcessingMode
@@ -17,12 +19,10 @@ from openviking.server.responses import response_from_result
 from openviking.server.skill_ingest import ingest_temp_upload_skill, install_skills
 from openviking.server.telemetry import run_operation
 from openviking.server.temp_upload_store import TempUploadStore
+from openviking.service.document_write import DocumentWriteRequest
 from openviking.storage.acl import AclSpec
 from openviking.telemetry import TelemetryRequest
 from openviking_cli.exceptions import InvalidArgumentError
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-
-from openviking.service.document_write import DocumentWriteRequest
 
 router = APIRouter(prefix="/api/v1", tags=["resources"])
 
@@ -38,7 +38,6 @@ async def document_write_contract(_ctx: RequestContext = Depends(get_request_con
 @router.get("/resources/document-node")
 async def document_node_route(uri: str, _ctx: RequestContext = Depends(get_request_context)):
     from openviking.server.models import Response
-
     from openviking.service.document_write import document_node
 
     return Response(status="ok", result=await document_node(get_service(), uri, _ctx))
@@ -49,7 +48,6 @@ async def document_write_route(
     request: DocumentWriteRequest, _ctx: RequestContext = Depends(get_request_context)
 ):
     from openviking.server.models import Response
-
     from openviking.service.document_write import write_document
 
     return Response(status="ok", result=await write_document(get_service(), request, _ctx))

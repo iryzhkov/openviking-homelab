@@ -3,8 +3,10 @@
 import asyncio
 
 import pytest
+
 from openviking.server.auth import get_request_context
 from openviking.server.identity import RequestContext, Role
+from openviking.service.document_write import DocumentWriteRequest, document_node, write_document
 from openviking.storage.acl import AclMode
 from openviking.utils.media_processor import UnifiedResourceProcessor
 from openviking_cli.exceptions import ConflictError, OpenVikingError, PermissionDeniedError
@@ -15,8 +17,6 @@ from tests.server.conftest import service as service
 from tests.server.conftest import temp_dir as temp_dir
 from tests.server.test_real_resource_producer_e2e import _root_ctx
 from tests.server.test_real_resource_producer_e2e import admitted_service as admitted_service
-
-from openviking.service.document_write import DocumentWriteRequest, document_node, write_document
 
 BASE = "viking://resources"
 TARGET = BASE + "/document.md"
