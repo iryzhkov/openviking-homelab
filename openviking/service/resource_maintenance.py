@@ -3,11 +3,16 @@
 """Resource maintenance without extraction, refresh, watch, version or task effects."""
 
 from openviking.server.error_mapping import is_not_found_error, map_exception
+from openviking.server.identity import RequestContext
 from openviking.storage.acl import AclAction
 from openviking.storage.internal_names import is_storage_internal_name
+from openviking.storage.viking_fs import VikingFS
 from openviking.utils.path_safety import validate_safe_viking_uri_path
 from openviking_cli.exceptions import (
-    ConflictError, FailedPreconditionError, InvalidArgumentError, NotFoundError,
+    ConflictError,
+    FailedPreconditionError,
+    InvalidArgumentError,
+    NotFoundError,
     OpenVikingError,
 )
 
@@ -15,12 +20,16 @@ from openviking_cli.exceptions import (
 def validate_resource_target(uri: str) -> str:
     """Accept only exact, concrete resources paths; never resolve aliases or IDs."""
     if not isinstance(uri, str) or not 1 <= len(uri) <= 2048:
-        raise InvalidArgumentError("A concrete resources URI of at most 2048 characters is required")
+        raise InvalidArgumentError(
+            "A concrete resources URI of at most 2048 characters is required"
+        )
     if not uri.startswith("viking://resources/"):
         raise InvalidArgumentError("A concrete path below viking://resources is required")
-    parts = uri[len("viking://resources/"):].split("/")
+    parts = uri[len("viking://resources/") :].split("/")
     if any(not part or part in {".", ".."} or is_storage_internal_name(part) for part in parts):
-        raise InvalidArgumentError("Empty, relative and storage-internal path segments are not allowed")
+        raise InvalidArgumentError(
+            "Empty, relative and storage-internal path segments are not allowed"
+        )
     # Reject alternate spellings rather than silently broadening the target.
     if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in uri) or any(
         c in uri for c in ("\\", "%", "?", "#", "{", "}")
@@ -34,7 +43,14 @@ def validate_resource_target(uri: str) -> str:
     return uri
 
 
-async def maintain_resource(viking_fs, uri, ctx, *, recursive=False, prune=False):
+async def maintain_resource(
+    viking_fs: VikingFS,
+    uri: str,
+    ctx: RequestContext,
+    *,
+    recursive: bool = False,
+    prune: bool = False,
+) -> dict[str, str]:
     """Remove a present node, or prune exact-URI records for an absent node.
 
     Absence and native ACL checks run under account-checked resources-root Tree
@@ -71,7 +87,10 @@ async def maintain_resource(viking_fs, uri, ctx, *, recursive=False, prune=False
                     raise InvalidArgumentError("Directory removal requires recursive=true")
             effects_started = True
             await viking_fs.rm(
-                uri, ctx=ctx, recursive=False if prune else recursive, lease_ref=lease,
+                uri,
+                ctx=ctx,
+                recursive=False if prune else recursive,
+                lease_ref=lease,
             )
         finally:
             await viking_fs._async_agfs.pathlock_release(lease)
@@ -81,8 +100,14 @@ async def maintain_resource(viking_fs, uri, ctx, *, recursive=False, prune=False
         mapped = exc if isinstance(exc, OpenVikingError) else map_exception(exc, resource=uri)
         code = getattr(mapped, "code", "INTERNAL")
         allowed = {
-            "INVALID_ARGUMENT", "INVALID_URI", "PERMISSION_DENIED", "NOT_FOUND",
-            "CONFLICT", "FAILED_PRECONDITION", "RESOURCE_BUSY", "RESOURCE_EXHAUSTED",
+            "INVALID_ARGUMENT",
+            "INVALID_URI",
+            "PERMISSION_DENIED",
+            "NOT_FOUND",
+            "CONFLICT",
+            "FAILED_PRECONDITION",
+            "RESOURCE_BUSY",
+            "RESOURCE_EXHAUSTED",
         }
         if code not in allowed:
             code = "INTERNAL"

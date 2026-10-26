@@ -546,12 +546,18 @@ class FSService:
     async def remove_resource_only(
         self, uri: str, ctx: RequestContext, *, recursive: bool = False,
     ) -> Dict[str, Any]:
-        from openviking.service.resource_maintenance import maintain_resource, validate_resource_target
+        from openviking.service.resource_maintenance import (
+            maintain_resource,
+            validate_resource_target,
+        )
         validate_resource_target(uri)
         return await maintain_resource(self._ensure_initialized(), uri, ctx, recursive=recursive)
 
     async def prune_resource_index(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
-        from openviking.service.resource_maintenance import maintain_resource, validate_resource_target
+        from openviking.service.resource_maintenance import (
+            maintain_resource,
+            validate_resource_target,
+        )
         validate_resource_target(uri)
         return await maintain_resource(self._ensure_initialized(), uri, ctx, prune=True)
 
