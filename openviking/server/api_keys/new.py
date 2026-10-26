@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 from typing_extensions import deprecated
 
 from openviking.server.account_stores.base import AccountStore
+from openviking.server.account_stores.models import AccountIdentity
 from openviking.server.api_keys.legacy import (
     derive_seeded_api_key_secret,
 )
@@ -211,6 +212,10 @@ class APIKeyManager:
 
     async def iter_deletions(self):
         return await self._store.iter_deletions()
+
+    async def get_account_identity(self, account_id: str) -> AccountIdentity | None:
+        """Internal lifetime probe; never expose this through account responses."""
+        return await self._store.get_account_identity(account_id)
 
     async def get_account(self, account_id):
         return await self._store.get_account(account_id)

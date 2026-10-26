@@ -327,13 +327,13 @@ class DeletionService:
                 )
             )
 
-            vectors = self._service.viking_fs.vector_store
-            if vectors is not None:
-                if user_id is None:
-                    await run_to_completion(
-                        lambda: vectors.delete_account_data(account_id, ctx=ctx)
-                    )
-                else:
+            if user_id is None:
+                # Keep file and vector teardown in one lease. In particular, a
+                # writer's index phase must finish before either is removed.
+                await run_to_completion(lambda: self._delete_account_files(account_id, ctx))
+            else:
+                vectors = self._service.viking_fs.vector_store
+                if vectors is not None:
                     await run_to_completion(
                         lambda: vectors.delete_user_data(account_id, user_id, ctx=ctx)
                     )
@@ -353,8 +353,10 @@ class DeletionService:
                 )
                 runtime_config = self._service.runtime_config_manager
                 if runtime_config is not None:
+                    # Config cleanup takes its own path lease, so it runs after
+                    # account coverage is released. Its acquisition can leave
+                    # empty directories, but cannot restore deleted content.
                     await run_to_completion(lambda: runtime_config.delete_account(account_id))
-                await run_to_completion(lambda: self._delete_account_files(account_id))
             else:
                 await run_to_completion(lambda: self._delete_uploads(ctx))
                 await run_to_completion(
@@ -376,14 +378,31 @@ class DeletionService:
         await tracker.complete(task_id, {"deleted": True}, **owner)
         return None
 
-    async def _delete_account_files(self, account_id: str) -> None:
-        agfs = self._service.viking_fs._async_agfs
+    async def _delete_account_files(self, account_id: str, ctx: RequestContext) -> None:
+        viking_fs = self._service.viking_fs
+        agfs = viking_fs._async_agfs
         path = f"/local/{account_id}"
+        # Busy acquisition must fail the task with its deletion fence intact.
+        # Never remove a foreign token or fall back to unlocked deletion.
+        lease = await agfs.pathlock_acquire_tree(path, timeout_secs=0.0)
         try:
-            await agfs.rm(path, recursive=True, auto_pathlock=False)
-        except Exception as exc:
-            if not is_not_found_error(exc):
-                raise
+            vectors = viking_fs.vector_store
+            if vectors is not None:
+                await vectors.delete_account_data(account_id, ctx=ctx)
+            try:
+                await agfs.rm(
+                    path, recursive=True, fs_ctx=viking_fs._pathlock_fs_ctx(ctx, lease)
+                )
+            except Exception as exc:
+                if not is_not_found_error(exc):
+                    raise
+        finally:
+            try:
+                await agfs.pathlock_release(lease)
+            except Exception as exc:
+                # Recursive removal includes our own token.
+                if not is_not_found_error(exc):
+                    raise
         try:
             await agfs.stat(path)
         except Exception as exc:

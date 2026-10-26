@@ -41,3 +41,4 @@ class AccountInfo:
     groups: Dict[str, dict] = field(default_factory=dict)
     groups_loaded: bool = True
     deletion: dict | None = None
+    creation_id: str | None = None

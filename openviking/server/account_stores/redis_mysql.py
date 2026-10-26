@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from openviking.server.account_stores.base import AccountStore
 from openviking.server.account_stores.models import (
+    AccountIdentity,
     AccountSummary,
     DeletionRecord,
     GroupSummary,
@@ -758,6 +759,10 @@ class RedisMySQLAccountStore(AccountStore):
 
     async def iter_deletions(self) -> list[tuple[str, str | None, DeletionRecord]]:
         return await self._mysql.iter_deletions()
+
+    async def get_account_identity(self, account_id: str) -> AccountIdentity | None:
+        # Lifetime and deletion state must bypass Redis, including negative cache.
+        return await self._mysql.get_account_identity(account_id)
 
     async def get_account(self, account_id: str) -> AccountSummary | None:
         return await self._mysql.get_account(account_id)
