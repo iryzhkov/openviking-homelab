@@ -319,6 +319,14 @@ async def test_conflicting_acl_refuses_before_private_preparation(admitted_servi
     assert request.expected.kind == "directory"
     preparation_calls = []
     publication_calls = []
+    validated_slots = []
+    original_validation = document_write._validate_acl_snapshots
+
+    def validate(rows):
+        validated_slots.append({(row["uri"], row["level"]) for row in rows})
+        return original_validation(rows)
+
+    monkeypatch.setattr(document_write, "_validate_acl_snapshots", validate)
 
     async def forbid_prepare(*args, **kwargs):
         preparation_calls.append(True)
@@ -334,6 +342,7 @@ async def test_conflicting_acl_refuses_before_private_preparation(admitted_servi
     with pytest.raises(FailedPreconditionError) as refused:
         await write_document(service, request, ctx)
     assert refused.value.details["content_state"] == "not_started"
+    assert validated_slots == [{(TARGET, 0), (TARGET, 1)}]
     assert preparation_calls == []
     assert publication_calls == []
     assert (await document_node(service, TARGET, ctx))["node"] == before

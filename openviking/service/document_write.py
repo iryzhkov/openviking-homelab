@@ -290,18 +290,22 @@ def _controls_for_level(old):
     return {key: value for key, value in controls.items() if key in permitted}
 
 
-async def _target_records(fs, uri, inventory, old, root_is_file, ctx):
-    shapes = {
-        "": not root_is_file,
-        **{key: value.is_dir for key, value in inventory.entries.items()},
-    }
+def _validate_acl_snapshots(records):
     policies = {}
-    for row in old.records:
+    for row in records:
         fields = tree_replace._controls(row)
         policy = (fields["acl_mode"], tuple(fields["acl_direct_grants"]))
         if row["uri"] in policies and policies[row["uri"]] != policy:
             raise FailedPreconditionError("Document controls contain conflicting ACL snapshots")
         policies[row["uri"]] = policy
+
+
+async def _target_records(fs, uri, inventory, old, root_is_file, ctx):
+    shapes = {
+        "": not root_is_file,
+        **{key: value.is_dir for key, value in inventory.entries.items()},
+    }
+    _validate_acl_snapshots(old.records)
     old_by_slot = {(row["uri"][len(uri) :], row.get("level")): row for row in old.records}
     old_root = [row for row in old.records if row["uri"] == uri]
     if any("#" in row["uri"][len(uri) :] for row in old.records):
@@ -585,6 +589,7 @@ async def _write_document(service, request, ctx, *, fault):
                 and (await _snapshot(fs, request.backup_uri, ctx, lease)).node["kind"] != "absent"
             ):
                 raise ConflictError("Document backup destination is occupied")
+            _validate_acl_snapshots(original.records)
             config_root = Path(get_openviking_config().storage.parse_output.resolved_local_root())
             config_root.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(
