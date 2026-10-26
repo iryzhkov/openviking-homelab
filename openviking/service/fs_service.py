@@ -464,6 +464,9 @@ class FSService:
 
         async def create():
             async with self._uri_mutation_coordinator.mutation(ctx.account_id, [directory_uri]):
+                if admitted is not None:
+                    await viking_fs._ensure_access(directory_uri, ctx, action=AclAction.WRITE)
+                    await self._refuse_watched_resource_targets(ctx, [directory_uri])
                 acl_update = (
                     await viking_fs.prepare_acl_update(directory_uri, acl, ctx)
                     if acl is not None
