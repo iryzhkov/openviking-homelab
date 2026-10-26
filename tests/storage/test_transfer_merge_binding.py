@@ -38,8 +38,14 @@ def binding_fs(tmp_path):
         pytest.skip("RAGFS native extension is unavailable")
     config = RagfsBindingConfig(agfs=AGFSConfig(path=str(tmp_path), backend="local"))
     client = client_type(None, config=config.to_binding_dict())
-    mount_agfs_backend(client, config)
-    return VikingFS(agfs=client)
+    try:
+        mount_agfs_backend(client, config)
+        yield VikingFS(agfs=client)
+    finally:
+        # Shut down this test's native mounts and cache runtime instead of
+        # leaking one native client per test. Dependent fixtures such as
+        # indexed_fs finish their own teardown first.
+        client.close()
 
 
 def root_ctx():
