@@ -40,7 +40,7 @@ from openviking.storage.queuefs.add_resource_msg import AddResourceMsg, AddResou
 from openviking.storage.queuefs.resource_embedding_fence import capture_resource_index_conditions
 from openviking.storage.resource_diff import build_rnfv_snapshot, prepare_artifact_inventory
 from openviking.storage.resource_rfv import validate_resource_reindex_uri
-from openviking.storage.resource_rnfv import RequestIntent
+from openviking.storage.resource_rnfv import CONTROL_BASENAMES, RequestIntent
 from openviking.storage.resource_target import AgfsResourceTarget
 from openviking.storage.vector_ids import vector_record_id
 from openviking.utils.ingest_options import IngestOptions
@@ -131,9 +131,11 @@ def _digest(value):
     ).hexdigest()
 
 
-def _uri(fs, uri, ctx):
+def _uri(fs, uri, ctx, *, generated=False):
     try:
         validate_resource_reindex_uri(fs, uri, ctx)
+        if not generated and any(part in CONTROL_BASENAMES for part in uri.split("/")[3:]):
+            raise ValueError()
         if any(is_storage_internal_name(part) for part in uri.split("/")[3:]):
             raise ValueError()
     except ValueError:
@@ -220,7 +222,7 @@ async def _snapshot(fs, uri, ctx, lease, *, owned_absence=False):
         bodies = {}
         for row in entries:
             child = uri + "/" + row["path"]
-            _uri(fs, child, ctx)
+            _uri(fs, child, ctx, generated=True)
             if row["type"] == "file":
                 bodies[row["path"]] = await fs.read_file_bytes(child, ctx=ctx)
     else:
@@ -334,6 +336,30 @@ async def _target_records(fs, uri, inventory, old, root_is_file, ctx):
     _, records = await fs.acl_manager.prepare_subtree_records(uri, records, ctx)
     backend = await fs._get_vector_store()._get_backend_for_context(ctx)
     return await backend._async_adapter.run(backend._prepare_upsert_payloads, records)
+
+
+async def _preflight_effects(fs, uri, inventory, old, records, root_is_file, ctx):
+    ancestors = []
+    parent = uri.rsplit("/", 1)[0]
+    while parent.startswith("viking://resources"):
+        ancestors.append(parent)
+        if parent == "viking://resources":
+            break
+        parent = parent.rsplit("/", 1)[0]
+    directories = (
+        0 if root_is_file else 1 + sum(entry.is_dir for entry in inventory.entries.values())
+    )
+    new_nodes = len(inventory.entries) + (0 if root_is_file else 1) + 2 * directories
+    old_nodes = len(old.entries) + (1 if old.node["kind"] == "directory" else 0)
+    if new_nodes + old_nodes + 2 * len(ancestors) > FORMAL_LIMIT:
+        raise ResourceExhaustedError("Document operation formal-node limit exceeded")
+    if len(old.records) + len(records) > RECORD_LIMIT:
+        raise ResourceExhaustedError("Document operation context limit exceeded")
+    metadata_roots = set(ancestors) | {row["uri"] for row in records if row["level"] in {0, 1}}
+    effects = [*ancestors]
+    for root in metadata_roots:
+        effects.extend([root + "/.abstract.md", root + "/.overview.md"])
+    await fs._ensure_access_many(effects, ctx, action=AclAction.WRITE)
 
 
 async def _publish_records(fs, uri, records, ctx):
@@ -525,6 +551,7 @@ async def _write_document(service, request, ctx, *, fault):
                     service, request, private, ctx
                 )
                 records = await _target_records(fs, uri, inventory, original, root_is_file, ctx)
+                await _preflight_effects(fs, uri, inventory, original, records, root_is_file, ctx)
                 target = AgfsResourceTarget(viking_fs=fs, root_uri=uri, ctx=ctx, lease_ref=lease)
                 intent = RequestIntent.from_ingest_options(
                     target_uri=uri,
@@ -553,6 +580,7 @@ async def _write_document(service, request, ctx, *, fault):
                     target=target,
                     vikingdb=service.resources._resource_processor.vikingdb,
                     context_type="resource",
+                    is_code_repo=False,
                     ctx=ctx,
                     account_id=ctx.account_id,
                     root_preexisting=False,
@@ -623,6 +651,8 @@ async def _write_document(service, request, ctx, *, fault):
                     raise RuntimeError("Document installed bytes verification failed")
                 # Read policy back before ACK and before handing off the original owner.
                 expected_controls = {row["id"]: tree_replace._controls(row) for row in records}
+                if set(expected_controls) != {row["id"] for row in installed.records}:
+                    raise RuntimeError("Document installed policy inventory changed")
                 for row in installed.records:
                     expected_control = expected_controls.get(row["id"])
                     if expected_control is None or any(
@@ -754,7 +784,7 @@ async def _write_document(service, request, ctx, *, fault):
             raise
         raise OpenVikingError(
             "Document publication failed", code="INTERNAL", details=details
-        ) from None
+        ) from failure
     finally:
         if lease is not None:
             with suppress(Exception):
