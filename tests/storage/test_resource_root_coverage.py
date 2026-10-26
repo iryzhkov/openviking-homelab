@@ -457,3 +457,31 @@ async def test_file_move_copy_failure_never_cleans_foreign_empty_destination(ena
     assert (await agfs.stat(path))["isDir"]
     assert await agfs.ls(path) == []
     assert await raw(fs, target + "/one.md", ctx) == b"old one"
+
+
+@pytest.mark.parametrize("remove_parent", [False, True])
+async def test_mixed_namespace_move_uses_stable_account_ancestor(enabled_tree, monkeypatch, remove_parent):
+    fs, _, ctx, target, *_ = enabled_tree
+    destination_parent = f"viking://user/{ctx.user.user_id}/resources/moved"
+    destination = destination_parent + "/one.md"
+    await fs.mkdir(destination_parent, ctx=ctx)
+    agfs, original = fs._async_agfs, fs._async_agfs.pathlock_acquire_batch
+    parent_path = fs._uri_to_path(destination_parent, ctx=ctx)
+    account_root = fs._uri_to_path("viking://resources", ctx=ctx).rsplit("/", 1)[0]
+    requests_seen = []
+    async def acquire(requests, *args, **kwargs):
+        if not requests_seen:
+            requests_seen.extend(requests)
+            if remove_parent:
+                await agfs.rm(parent_path, recursive=True)
+        return await original(requests, *args, **kwargs)
+    monkeypatch.setattr(agfs, "pathlock_acquire_batch", acquire)
+    if remove_parent:
+        with pytest.raises(NotFoundError):
+            await fs.mv(target + "/one.md", destination, ctx=ctx, no_replace=True)
+        assert not await fs.exists(destination_parent, ctx=ctx)
+        assert await raw(fs, target + "/one.md", ctx) == b"old one"
+    else:
+        await fs.mv(target + "/one.md", destination, ctx=ctx, no_replace=True)
+        assert await raw(fs, destination, ctx) == b"old one"
+    assert requests_seen == [{"path": account_root, "kind": "tree"}]

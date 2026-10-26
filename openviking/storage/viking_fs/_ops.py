@@ -170,8 +170,18 @@ class _OpsMixin:
         from openviking.service.account_identity import recheck_account_identity
         real_ctx = self._ctx_or_default(ctx)
         root = self._uri_to_path("viking://resources", ctx=real_ctx)
+        coverage = [{"path": root, "kind": "tree"}, *requests]
+        if any(not (item["path"].rstrip("/") == root or
+                    item["path"].startswith(root + "/")) for item in requests):
+            # Mixed-namespace moves need stable coverage for their other parent.
+            # D1 and the fresh D2 check also protect this existing account ancestor.
+            account_root = root.rsplit("/", 1)[0]
+            if any(not (item["path"].rstrip("/") == account_root or
+                        item["path"].startswith(account_root + "/")) for item in requests):
+                raise FailedPreconditionError("Qualified resource coverage cannot cross account roots")
+            coverage = [{"path": account_root, "kind": "tree"}]
         lease = await self._async_agfs.pathlock_acquire_batch(
-            self._collapse_lock_requests([{"path": root, "kind": "tree"}, *requests]),
+            self._collapse_lock_requests(coverage),
             owner_lease_ref=owner_lease_ref,
         )
         try:
