@@ -806,6 +806,50 @@ class ReindexExecutor:
         root_is_dir: bool | None = None,
         formal_entries: list[dict[str, Any]] | None = None,
     ) -> None:
+        from openviking.service.account_identity import AccountIdentity
+        from openviking.storage.queuefs.resource_embedding_fence import (
+            ResourceEmbeddingConflict,
+            _resource_uri,
+        )
+
+        coverage = PathLockGuard(get_service().viking_fs._async_agfs)
+        try:
+            if _resource_uri(uri) and mode == "vectors_only":
+                if not run.resource_creation_identity or run.lease is None:
+                    raise ResourceEmbeddingConflict("Reindex lacks its original admitted owner")
+                fs = get_service().viking_fs
+                if await fs._async_agfs.pathlock_refresh(run.lease) != "refreshed":
+                    raise ResourceEmbeddingConflict("Reindex lost its original admitted owner")
+                await coverage.acquire(
+                    lambda: fs._acquire_resource_coverage(
+                        run.ctx,
+                        AccountIdentity(run.resource_creation_identity, False),
+                        owner_lease_ref=run.lease,
+                    )
+                )
+            await self._reindex_rfv_owned(
+                uri=uri,
+                mode=mode,
+                context_type=context_type,
+                recursive=recursive,
+                run=run,
+                root_is_dir=root_is_dir,
+                formal_entries=formal_entries,
+            )
+        finally:
+            await coverage.close()
+
+    async def _reindex_rfv_owned(
+        self,
+        *,
+        uri: str,
+        mode: str,
+        context_type: str,
+        recursive: bool,
+        run: _ReindexRunContext,
+        root_is_dir: bool | None = None,
+        formal_entries: list[dict[str, Any]] | None = None,
+    ) -> None:
         from openviking.storage.context_update_plan import build_rfv_context_update_plan
         from openviking.storage.resource_rfv import build_rfv_snapshot
         from openviking.storage.resource_rnfv import RequestIntent
@@ -867,6 +911,19 @@ class ReindexExecutor:
                     account_id=run.ctx.account_id,
                     source_metadata=snapshot.source_metadata,
                 )
+        from openviking.storage.queuefs.resource_embedding_fence import (
+            ResourceEmbeddingConflict,
+            _resource_uri,
+        )
+
+        if (
+            _resource_uri(uri)
+            and mode == "vectors_only"
+            and (plan.semantic_plan is not None or plan.file_refresh is not None)
+        ):
+            raise ResourceEmbeddingConflict(
+                "Resource vectors-only reindex cannot request semantic or parent refresh"
+            )
         run.counters.scanned_records += len(snapshot.formal.entries)
         if plan.direct_index_actions:
             from openviking.storage.queuefs.resource_embedding_fence import (
@@ -875,11 +932,47 @@ class ReindexExecutor:
             )
 
             if _resource_uri(uri):
-                # A queued reindex has no request-time per-action conditions.
-                # Original account admission alone cannot authorize these actions.
-                raise ResourceEmbeddingConflict(
-                    "Resource reindex index actions require original per-action conditions"
+                if (
+                    mode != "vectors_only"
+                    or plan.semantic_plan is not None
+                    or plan.file_refresh is not None
+                ):
+                    raise ResourceEmbeddingConflict(
+                        "Resource reindex mixed semantic plans remain unsupported"
+                    )
+                from openviking.service.account_identity import AccountIdentity
+                from openviking.storage.queuefs.resource_embedding_fence import (
+                    capture_resource_index_conditions,
                 )
+
+                # The plan was read under this continuously adopted original
+                # owner, not loaded from cached plan metadata or a new lease.
+                owner_ctx = self._content_owner_ctx(uri, run.ctx)
+                conditions = await capture_resource_index_conditions(
+                    plan.direct_index_actions,
+                    owner_ctx,
+                    AccountIdentity(run.resource_creation_identity, False),
+                    run.lease,
+                )
+                processor = getattr(service, "_resource_processor", None)
+                if processor is None:
+                    processor = ResourceProcessor(service.vikingdb_manager)
+                await processor._enqueue_index_actions(
+                    plan.direct_index_actions,
+                    ctx=owner_ctx,
+                    ingest_options=run.ingest_options,
+                    source_contents=dict(snapshot.source_contents),
+                    source_metadata=snapshot.source_metadata,
+                    resource_conditions=conditions,
+                    owner_lease_ref=run.lease,
+                )
+                run.counters.deleted_records += sum(
+                    action.action.value == "delete" for action in plan.direct_index_actions
+                )
+                run.counters.rebuilt_records += sum(
+                    action.action.value != "delete" for action in plan.direct_index_actions
+                )
+                return
             owner_ctx = self._content_owner_ctx(uri, run.ctx)
             delete_actions = tuple(
                 action for action in plan.direct_index_actions if action.action.value == "delete"

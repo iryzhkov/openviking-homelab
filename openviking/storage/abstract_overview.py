@@ -679,6 +679,7 @@ async def plan_abstract_overview_refresh(
     overview_sample_limit: int = 32,
     refresh_ratio: float = 0.10,
     lock_timeout_secs: float = 0.0,
+    lease_ref: Optional[Dict[str, Any]] = None,
 ) -> FreshnessDecision:
     """Atomically record direct-child changes and choose refresh scheduling.
 
@@ -721,9 +722,12 @@ async def plan_abstract_overview_refresh(
             force_refresh=force_refresh,
         )
     lock_paths = [viking_fs._uri_to_path(uri, ctx=ctx) for uri in uris]
-    lease = await viking_fs._async_agfs.pathlock_acquire_exact_batch(
-        lock_paths, timeout_secs=lock_timeout_secs
-    )
+    owns_lease = lease_ref is None
+    lease = lease_ref
+    if owns_lease:
+        lease = await viking_fs._async_agfs.pathlock_acquire_exact_batch(
+            lock_paths, timeout_secs=lock_timeout_secs
+        )
     try:
         documents = [await _read_existing_document(viking_fs, uri, ctx) for uri in uris]
         baselines = [
@@ -776,7 +780,8 @@ async def plan_abstract_overview_refresh(
                 await viking_fs.write_file(uri, rendered, ctx=ctx, lease_ref=lease)
         return decision
     finally:
-        await viking_fs._async_agfs.pathlock_release(lease)
+        if owns_lease:
+            await viking_fs._async_agfs.pathlock_release(lease)
 
 
 async def read_abstract_overview_pending_snapshot(
@@ -834,6 +839,7 @@ async def mark_abstract_overview_pending(
     dir_uri: str,
     changed_entries: int,
     ctx: Optional[RequestContext],
+    lease_ref: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Compatibility wrapper for callers that only need the metadata mark."""
 
@@ -842,4 +848,5 @@ async def mark_abstract_overview_pending(
         dir_uri=dir_uri,
         changed_entries=changed_entries,
         ctx=ctx,
+        lease_ref=lease_ref,
     )
