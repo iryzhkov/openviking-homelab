@@ -70,6 +70,9 @@ class SemanticQueue(NamedQueue):
                 _SEMANTIC_COALESCE_VERSION[msg.coalesce_key] = version
                 msg.coalesce_version = version
 
+        from .resource_embedding_fence import stamp_resource_semantic_admission
+
+        await stamp_resource_semantic_admission(msg)
         msg.queue_enqueued_at = time.time()
 
         return await super().enqueue(msg.to_dict())

@@ -365,3 +365,51 @@ async def resource_embedding_commit(msg, ctx, db):
         yield
     finally:
         await guard.close()
+
+
+_semantic_admission: ContextVar[tuple[str, str] | None] = ContextVar(
+    "resource_semantic_admission", default=None
+)
+
+
+@contextmanager
+def bind_resource_semantic_admission(account_id: str, creation_identity):
+    """Bind an identity the caller captured at its authorized request.
+
+    The caller must already have rechecked it under its original live owner
+    lease after committing input. This never captures a fresh identity.
+    """
+    if not isinstance(creation_identity, str) or not creation_identity:
+        raise ResourceEmbeddingConflict("Resource semantic admission lacks original identity")
+    token = _semantic_admission.set((account_id, creation_identity))
+    try:
+        yield
+    finally:
+        _semantic_admission.reset(token)
+
+
+async def stamp_resource_semantic_admission(msg) -> None:
+    """Stamp a resource SemanticMsg only inside a bound original admission.
+
+    Unbound producers are left unstamped; resource semantic processing refuses
+    them. An existing stamp is never replaced.
+    """
+    if msg.context_type != "resource":
+        return
+    bound = _semantic_admission.get()
+    if bound is None:
+        return
+    account_id, identity = bound
+    if msg.account_id != account_id:
+        raise ResourceEmbeddingConflict("Resource semantic admission account changed")
+    if msg.resource_creation_identity and msg.resource_creation_identity != identity:
+        raise ResourceEmbeddingConflict("Resource semantic admission identity changed")
+    if msg.lock_handoff is None:
+        raise ResourceEmbeddingConflict("Resource semantic admission requires the original handoff")
+    from openviking.service.account_identity import recheck_account_identity
+    from openviking.storage.viking_fs import get_viking_fs
+
+    await recheck_account_identity(
+        get_viking_fs()._account_identity_manager, account_id, AccountIdentity(identity, False)
+    )
+    msg.resource_creation_identity = identity

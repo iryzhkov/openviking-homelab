@@ -129,7 +129,19 @@ class ResourceSemanticMessageWork(SemanticMessageWork):
         async def acquire() -> None:
             fs = get_viking_fs()
             msg = self.msg
-            admitted = await fs._capture_resource_identity(ctx)
+            from openviking.server.account_stores.models import AccountIdentity
+            from openviking.service.account_identity import recheck_account_identity
+
+            # Only the original authorized request may supply the identity.
+            # Refuse before any lock or filesystem mutation; never capture a
+            # fresh identity for a cached message.
+            original = msg.resource_creation_identity
+            if not isinstance(original, str) or not original:
+                raise ResourceInputConflict(
+                    "Resource semantic work lacks its original request identity"
+                )
+            admitted = AccountIdentity(original, False)
+            await recheck_account_identity(fs._account_identity_manager, ctx.account_id, admitted)
             self.scope = await SemanticLockScope.resolve(
                 msg.lock_handoff, caller_lock=self.caller_lock, refuse_stale=True
             )
@@ -198,11 +210,11 @@ class ResourceSemanticMessageWork(SemanticMessageWork):
                         )
             if not msg.skip_vectorization and get_task_context() is None:
                 raise ResourceInputConflict("Resource vector work requires tracked completion")
-            from openviking.service.account_identity import recheck_account_identity
             from openviking.storage.queuefs.resource_embedding_fence import (
                 ResourceEmbeddingProducer,
             )
 
+            # Compare the original identity again after final coverage.
             await recheck_account_identity(fs._account_identity_manager, ctx.account_id, admitted)
             # Processing-time identity does not prove the original request
             # lifetime, so cached plan patches/deletes stay fail-closed here.

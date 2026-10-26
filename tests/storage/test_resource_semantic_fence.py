@@ -103,6 +103,9 @@ def env(tmp_path, monkeypatch):
     )
 
     def message(**kwargs):
+        # Resource messages carry the original request identity captured by
+        # their producer; processing never captures a fresh one.
+        kwargs.setdefault("resource_creation_identity", "test-creation")
         return SemanticMsg(
             uri=root_uri,
             context_type="resource",

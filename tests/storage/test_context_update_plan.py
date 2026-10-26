@@ -3978,11 +3978,22 @@ async def test_process_resource_does_not_handoff_local_artifact(
     processor._commit_directory_artifact_with_plan = AsyncMock(
         return_value=ContextUpdatePlan("viking://resources/repo", "resource")
     )
+    from openviking.server.account_stores.models import AccountIdentity
+
+    # Resource requests capture account identity at admission and recheck it
+    # under their owned lease before planning.
+    identity = AccountIdentity("creation", False)
     viking_fs = SimpleNamespace(
         exists=AsyncMock(return_value=False),
         _uri_to_path=lambda uri, ctx=None: uri,
         bind_request_context=lambda ctx: nullcontext(),
-        _async_agfs=SimpleNamespace(pathlock_release=AsyncMock()),
+        _async_agfs=SimpleNamespace(
+            pathlock_release=AsyncMock(), pathlock_refresh=AsyncMock(return_value="refreshed")
+        ),
+        _capture_resource_identity=AsyncMock(return_value=identity),
+        _account_identity_manager=SimpleNamespace(
+            get_account_identity=AsyncMock(return_value=identity)
+        ),
     )
     monkeypatch.setattr("openviking.utils.resource_processor.get_viking_fs", lambda: viking_fs)
     processor.acquire_resource_lock = AsyncMock(return_value={"lease_ref": "x"})

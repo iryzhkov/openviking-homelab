@@ -87,6 +87,10 @@ class SemanticMsg:
     file_vector_actions: Dict[str, str] = field(default_factory=dict)
     file_ingest_options: Dict[str, IngestOptions] = field(default_factory=dict)
     plan: Optional[SemanticPlan] = None
+    # Account creation identity captured by the original authorized resource
+    # request. Empty for non-resource and legacy messages; resource semantic
+    # processing refuses an empty value rather than capturing a fresh one.
+    resource_creation_identity: str = ""
 
     def __init__(
         self,
@@ -124,7 +128,11 @@ class SemanticMsg:
         plan: SemanticPlan | Dict[str, Any] | None = None,
         queue_enqueued_at: float = 0.0,
         failure_requeue_count: int = 0,
+        resource_creation_identity: str = "",
     ):
+        if not isinstance(resource_creation_identity, str):
+            raise ValueError("resource_creation_identity must be a string")
+        self.resource_creation_identity = resource_creation_identity
         self.id = str(uuid4())
         self.timestamp = int(datetime.now().timestamp())
         self.queue_enqueued_at = max(float(queue_enqueued_at or 0.0), 0.0)
@@ -266,6 +274,7 @@ class SemanticMsg:
             plan=data.get("plan") if isinstance(data.get("plan"), dict) else None,
             queue_enqueued_at=data.get("queue_enqueued_at", 0.0),
             failure_requeue_count=data.get("failure_requeue_count", 0),
+            resource_creation_identity=data.get("resource_creation_identity", ""),
         )
         if "id" in data and data["id"]:
             obj.id = data["id"]

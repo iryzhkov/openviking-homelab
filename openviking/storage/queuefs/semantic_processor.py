@@ -451,6 +451,8 @@ class SemanticProcessor(DequeueHandlerBase):
             skip_vectorization=msg.skip_vectorization,
             changes={"modified": [uri]},
             generation_trigger="parent_refresh",
+            # Derived work keeps the original request identity; it never mints one.
+            resource_creation_identity=msg.resource_creation_identity,
             coalesce_key=build_semantic_coalesce_key(
                 context_type=msg.context_type,
                 uri=parent_uri,
@@ -575,7 +577,9 @@ class SemanticProcessor(DequeueHandlerBase):
                     await work.skip()
                     await self._cleanup_local_artifact(msg)
                     if msg.context_type == "resource":
-                        return ProcessResult.failed("Resource semantic work was superseded before execution")
+                        return ProcessResult.failed(
+                            "Resource semantic work was superseded before execution"
+                        )
                     return ProcessResult.success()
             # Circuit breaker: if API is known-broken, re-enqueue and wait
             try:
@@ -779,10 +783,10 @@ class SemanticProcessor(DequeueHandlerBase):
                                 copy_source_uri=msg.copy_source_uri,
                                 file_md5s=msg.file_md5s,
                                 before_resource_write=(
-                                        work.validate_ownership
-                                        if isinstance(work, ResourceSemanticMessageWork)
-                                        else None
-                                    ),
+                                    work.validate_ownership
+                                    if isinstance(work, ResourceSemanticMessageWork)
+                                    else None
+                                ),
                                 artifact_files=msg.artifact_files,
                                 file_abstracts=msg.file_abstracts,
                                 file_vector_actions=msg.file_vector_actions,

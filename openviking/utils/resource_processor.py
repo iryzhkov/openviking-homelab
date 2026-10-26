@@ -1377,19 +1377,48 @@ class ResourceProcessor:
                             if resource_lock is not None
                             else None
                         )
-                        try:
-                            summary_result = await (await self._summarizer_for(ctx)).summarize(
-                                resource_uris=[root_uri],
-                                ctx=ctx,
-                                skip_vectorization=not build_index,
-                                lock=summary_guard,
-                                temp_uris=[temp_uri],
-                                is_code_repo=bool(prepared.get("is_code_repo")),
-                                ingest_options=ingest_options,
-                                semantic_source=semantic_source,
-                                generation_trigger="resource_ingest",
-                                semantic_plan=semantic_plan,
+                        from contextlib import nullcontext
+
+                        semantic_admission = nullcontext()
+                        if _resource_uri(root_uri):
+                            from openviking.server.account_stores.models import AccountIdentity
+                            from openviking.service.account_identity import (
+                                recheck_account_identity,
                             )
+                            from openviking.storage.queuefs.resource_embedding_fence import (
+                                bind_resource_semantic_admission,
+                            )
+
+                            # Recheck the identity captured at this request under
+                            # the original live owner, after input is committed.
+                            original_identity = prepared.get("resource_creation_identity")
+                            if resource_lock is None or (
+                                await get_viking_fs()._async_agfs.pathlock_refresh(resource_lock)
+                                != "refreshed"
+                            ):
+                                raise ValueError("Resource semantic admission lost ownership")
+                            await recheck_account_identity(
+                                get_viking_fs()._account_identity_manager,
+                                ctx.account_id,
+                                AccountIdentity(original_identity, False),
+                            )
+                            semantic_admission = bind_resource_semantic_admission(
+                                ctx.account_id, original_identity
+                            )
+                        try:
+                            with semantic_admission:
+                                summary_result = await (await self._summarizer_for(ctx)).summarize(
+                                    resource_uris=[root_uri],
+                                    ctx=ctx,
+                                    skip_vectorization=not build_index,
+                                    lock=summary_guard,
+                                    temp_uris=[temp_uri],
+                                    is_code_repo=bool(prepared.get("is_code_repo")),
+                                    ingest_options=ingest_options,
+                                    semantic_source=semantic_source,
+                                    generation_trigger="resource_ingest",
+                                    semantic_plan=semantic_plan,
+                                )
                         finally:
                             if summary_guard is not None:
                                 resource_lock = summary_guard.lease
