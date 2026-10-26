@@ -25,7 +25,7 @@ from openviking.parse.output import (
 )
 from openviking.server.error_mapping import is_not_found_error
 from openviking.service.account_identity import recheck_account_identity
-from openviking.storage.acl import AclAction, AclMode, AclMode
+from openviking.storage.acl import AclAction, AclMode
 from openviking.storage.context_update_plan import (
     build_context_update_plan_from_snapshot,
     execute_content_tree_actions,
@@ -583,8 +583,11 @@ async def _write_document(service, request, ctx, *, fault):
                         fs, uri, request.backup_uri, old_records, ctx, anchor=anchor
                     )
                     _, backup_records = await fs.acl_manager.prepare_subtree_records(
-                        request.backup_uri, backup_records, ctx,
-                        root_direct=anchor.permissions, root_mode=AclMode.RESTRICTED,
+                        request.backup_uri,
+                        backup_records,
+                        ctx,
+                        root_direct=anchor.permissions,
+                        root_mode=AclMode.RESTRICTED,
                     )
                     await step("backup")
                     backup_started = True
