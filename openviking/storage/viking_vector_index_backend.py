@@ -2584,9 +2584,16 @@ class VikingVectorIndexBackend:
 
     async def delete_uris(self, ctx: RequestContext, uris: List[str]) -> None:
         for uri in uris:
+            # Shared resources retain only the two literal entry spellings.
+            # Eq declares depth zero; URI In does not declare a depth.
+            trailing_uri_filter = (
+                Eq("uri", f"{uri}/")
+                if uri == "viking://resources" or uri.startswith("viking://resources/")
+                else In("uri", [f"{uri}/"])
+            )
             conds: List[FilterExpr] = [
                 Eq("account_id", ctx.account_id),
-                Or([Eq("uri", uri), In("uri", [f"{uri}/"])]),
+                Or([Eq("uri", uri), trailing_uri_filter]),
             ]
 
             backend = await self._get_backend_for_context(ctx)
