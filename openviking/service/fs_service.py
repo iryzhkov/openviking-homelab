@@ -598,7 +598,12 @@ class FSService:
         return await self._maintain_unwatched_resource(uri, ctx, prune=True)
 
     async def _maintain_unwatched_resource(
-        self, uri: str, ctx: RequestContext, *, recursive: bool = False, prune: bool = False,
+        self,
+        uri: str,
+        ctx: RequestContext,
+        *,
+        recursive: bool = False,
+        prune: bool = False,
     ) -> Dict[str, Any]:
         """Run resources-only maintenance under the URI mutation lease.
 
@@ -615,13 +620,9 @@ class FSService:
             await viking_fs._ensure_access(uri, ctx, action=AclAction.MANAGE)
             await viking_fs._ensure_access(uri, ctx, action=AclAction.WRITE)
             await self._refuse_watched_resource_targets(ctx, [uri])
-            return await maintain_resource(
-                viking_fs, uri, ctx, recursive=recursive, prune=prune
-            )
+            return await maintain_resource(viking_fs, uri, ctx, recursive=recursive, prune=prune)
 
-    async def _refuse_watched_resource_targets(
-        self, ctx: RequestContext, uris: List[str]
-    ) -> None:
+    async def _refuse_watched_resource_targets(self, ctx: RequestContext, uris: List[str]) -> None:
         """Refuse a qualified resources mutation that overlaps scheduled processing.
 
         Call only while ``_uri_mutation_coordinator.mutation`` covers ``uris``
@@ -654,9 +655,7 @@ class FSService:
             )
 
         def refuse() -> ConflictError:
-            return ConflictError(
-                "Resource target is in use by scheduled or in-flight processing"
-            )
+            return ConflictError("Resource target is in use by scheduled or in-flight processing")
 
         manager = self._get_watch_manager()
         # No manager means the scheduler is disabled (or absent): no tick can run.
@@ -1211,10 +1210,26 @@ class FSService:
         self._reject_storage_internal_target(to_uri)
         self._reject_file_only_semantic_sidecar_target(to_uri)
         validate_account_memory_template_transfer(to_uri)
-        await self._finish_transfer_after_caller_cancel(
-            self._mv_and_refresh(from_uri, to_uri, ctx=ctx, no_replace=no_replace),
-            operation="move",
+        qualified = no_replace and any(
+            self._ensure_initialized()._is_shared_resource_uri(uri) for uri in (from_uri, to_uri)
         )
+
+        async def execute():
+            if qualified:
+                await run_tracked_operation(
+                    "fs_mv",
+                    account_id=ctx.account_id,
+                    user_id=ctx.user.user_id,
+                    resource_id=to_uri,
+                    wait=True,
+                    operation=lambda: self._mv_and_refresh(
+                        from_uri, to_uri, ctx=ctx, no_replace=no_replace
+                    ),
+                )
+            else:
+                await self._mv_and_refresh(from_uri, to_uri, ctx=ctx, no_replace=no_replace)
+
+        await self._finish_transfer_after_caller_cancel(execute(), operation="move")
 
     async def tree_revision(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
         """Return a directory's tree revision, read under a Tree lease."""
@@ -1278,34 +1293,46 @@ class FSService:
         ctx: RequestContext,
         no_replace: bool = False,
     ) -> None:
-        """Hold qualified coverage before version/watch bookkeeping."""
+        """Hold original admission and parent scopes through refresh dispatch."""
         viking_fs = self._ensure_initialized()
         qualified = no_replace and any(
             viking_fs._is_shared_resource_uri(uri) for uri in (from_uri, to_uri)
         )
-        lease = None
-        if qualified:
-            # Fast refusal before native coverage. The authoritative check runs
-            # again under the coordinator mutation in move().
-            await viking_fs._ensure_access(from_uri, ctx, action=AclAction.WRITE)
-            await viking_fs._ensure_access(to_uri, ctx, action=AclAction.WRITE)
-            await self._refuse_watched_resource_targets(ctx, [from_uri, to_uri])
-            admitted = await viking_fs._capture_resource_identity(ctx)
+        if not qualified:
+            return await self._mv_and_refresh_covered(
+                from_uri, to_uri, ctx=ctx, no_replace=no_replace
+            )
+        await viking_fs._ensure_access(from_uri, ctx, action=AclAction.WRITE)
+        await viking_fs._ensure_access(to_uri, ctx, action=AclAction.WRITE)
+        await self._refuse_watched_resource_targets(ctx, [from_uri, to_uri])
+        admitted = await viking_fs._capture_resource_identity(ctx)
+        parents = [VikingURI(uri).parent.uri for uri in (from_uri, to_uri)]
+        if any(
+            namespace_policy_for_uri(uri).processing_mode is not NamespaceProcessingMode.INDEXED
+            for uri in (from_uri, to_uri)
+        ):
+            raise InvalidArgumentError("Qualified move across processing namespaces is unsupported")
+        async with self._uri_mutation_coordinator.mutation(
+            ctx.account_id, [from_uri, to_uri, *parents]
+        ):
+            for parent in dict.fromkeys(parents):
+                await viking_fs._ensure_access(parent, ctx, action=AclAction.WRITE)
+            await self._refuse_watched_resource_targets(ctx, parents)
             requests = [
-                {"path": viking_fs._uri_to_path(uri, ctx=ctx).rsplit("/", 1)[0], "kind": "tree"}
-                for uri in (from_uri, to_uri)
+                {"path": viking_fs._uri_to_path(uri, ctx=ctx), "kind": "tree"} for uri in parents
             ]
             lease = await viking_fs._acquire_resource_coverage(ctx, admitted, requests=requests)
-        try:
-            return await self._mv_and_refresh_covered(
-                from_uri,
-                to_uri,
-                ctx=ctx,
-                no_replace=no_replace,
-                coverage=lease,
-            )
-        finally:
-            if lease is not None:
+            try:
+                return await self._mv_and_refresh_covered(
+                    from_uri,
+                    to_uri,
+                    ctx=ctx,
+                    no_replace=no_replace,
+                    coverage=lease,
+                    admitted=admitted,
+                    coordinator_held=True,
+                )
+            finally:
                 await viking_fs._async_agfs.pathlock_release(lease)
 
     async def _mv_and_refresh_covered(
@@ -1316,6 +1343,8 @@ class FSService:
         ctx: RequestContext,
         no_replace: bool = False,
         coverage=None,
+        admitted=None,
+        coordinator_held: bool = False,
     ) -> None:
         """Commit move/watch state and enqueue affected parent refreshes."""
         viking_fs = self._ensure_initialized()
@@ -1356,7 +1385,14 @@ class FSService:
             vector_mode = "none"
 
         async def move() -> None:
-            async with self._uri_mutation_coordinator.mutation(ctx.account_id, [from_uri, to_uri]):
+            from contextlib import nullcontext
+
+            coordinator = (
+                nullcontext()
+                if coordinator_held
+                else self._uri_mutation_coordinator.mutation(ctx.account_id, [from_uri, to_uri])
+            )
+            async with coordinator:
                 if qualified:
                     await self._refuse_watched_resource_targets(ctx, [from_uri, to_uri])
                 if use_watch_transaction:
@@ -1433,7 +1469,13 @@ class FSService:
                         exc,
                     )
         else:
-            await self._refresh_move_parents(from_uri=from_uri, to_uri=to_uri, ctx=ctx)
+            await self._refresh_move_parents(
+                from_uri=from_uri,
+                to_uri=to_uri,
+                ctx=ctx,
+                admitted=admitted,
+                owner_lease_ref=coverage,
+            )
 
     @asynccontextmanager
     async def _record_transfer(
@@ -1555,6 +1597,8 @@ class FSService:
         to_uri: str,
         ctx: RequestContext,
         refresh_target: bool = True,
+        admitted=None,
+        owner_lease_ref=None,
     ) -> None:
         """Queue transfer refreshes for both affected parents after mv commits."""
         if is_watch_task_control_uri(from_uri) or is_watch_task_control_uri(to_uri):
@@ -1572,6 +1616,16 @@ class FSService:
             refreshes.append((target_parent_uri, to_uri, "added", target_context_type))
 
         for parent_uri, changed_uri, change_kind, context_type in refreshes:
+            if admitted is not None and context_type == "resource":
+                await self._enqueue_owned_move_refresh(
+                    parent_uri=parent_uri,
+                    changed_uri=changed_uri,
+                    change_kind=change_kind,
+                    ctx=ctx,
+                    admitted=admitted,
+                    owner_lease_ref=owner_lease_ref,
+                )
+                continue
             try:
                 await self._enqueue_copy_refresh(
                     root_uri=parent_uri,
@@ -1588,6 +1642,65 @@ class FSService:
                     parent_uri,
                     exc,
                 )
+
+    async def _enqueue_owned_move_refresh(
+        self, *, parent_uri, changed_uri, change_kind, ctx, admitted, owner_lease_ref
+    ):
+        from openviking.service.account_identity import recheck_account_identity
+        from openviking.storage.pathlock_transfer import PathLockGuard
+        from openviking.storage.queuefs.resource_embedding_fence import (
+            ResourceEmbeddingConflict,
+            bind_resource_semantic_admission,
+        )
+
+        fs = self._ensure_initialized()
+        if owner_lease_ref is None:
+            raise ResourceEmbeddingConflict("Move refresh lacks its original owner")
+        if await fs._async_agfs.pathlock_refresh(owner_lease_ref) != "refreshed":
+            raise ResourceEmbeddingConflict("Move refresh lost its original owner")
+        await recheck_account_identity(fs._account_identity_manager, ctx.account_id, admitted)
+        guard = PathLockGuard(fs._async_agfs)
+        try:
+            await guard.acquire(
+                lambda: fs._async_agfs.pathlock_acquire_tree(
+                    fs._uri_to_path(parent_uri, ctx=ctx), owner_lease_ref=owner_lease_ref
+                )
+            )
+            await recheck_account_identity(fs._account_identity_manager, ctx.account_id, admitted)
+            await mark_abstract_overview_pending(
+                viking_fs=fs,
+                dir_uri=parent_uri,
+                changed_entries=1,
+                ctx=ctx,
+                lease_ref=guard.lease,
+            )
+            handoff = await guard.to_handoff()
+            msg = SemanticMsg(
+                uri=parent_uri,
+                context_type="resource",
+                recursive=False,
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+                group_ids=ctx.group_ids,
+                peer_id=ctx.user.user_id,
+                role=str(ctx.role),
+                lock_handoff=handoff,
+                changes={change_kind: [changed_uri]},
+                generation_trigger="content_move",
+                telemetry_id=get_current_telemetry().telemetry_id,
+            )
+            queue_manager = get_queue_manager()
+            queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
+
+            async def dispatch():
+                with bind_resource_semantic_admission(ctx.account_id, admitted.creation_identity):
+                    return await queue.enqueue(msg)
+
+            await guard.handoff_and_dispatch(
+                handoff, dispatch, accepted=lambda result: result != "deduplicated"
+            )
+        finally:
+            await guard.close()
 
     async def _sync_watch_after_rm(self, uri: str, *, account_id: str, context_type: str) -> None:
         if context_type != "resource":
