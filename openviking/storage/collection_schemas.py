@@ -660,6 +660,8 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 )
             return updated_record
 
+        if is_resource_embedding(embedding_msg):
+            raise ValueError("Resource field patch cannot recreate a missing index context")
         initial_record = field_patch.apply({**field_patch.seed_fields, "id": record_id})
         missing_fields = missing_initial_record_fields(initial_record)
         if missing_fields:
@@ -713,7 +715,12 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
                 if embedding_msg.action not in {IndexAction.UPSERT, IndexAction.MERGE}:
                     async with resource_embedding_commit(embedding_msg, ctx, self._vikingdb):
-                        result = await self._apply_non_embedding_operation(embedding_msg, ctx)
+                        if is_resource_embedding(embedding_msg):
+                            result = await run_to_completion(
+                                lambda: self._apply_non_embedding_operation(embedding_msg, ctx)
+                            )
+                        else:
+                            result = await self._apply_non_embedding_operation(embedding_msg, ctx)
                     self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
                     return ProcessResult.success(result)
 

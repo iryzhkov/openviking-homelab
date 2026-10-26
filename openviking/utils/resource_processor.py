@@ -813,6 +813,13 @@ class ResourceProcessor:
             "errors": [],
             "source_path": None,
         }
+        from openviking.storage.queuefs.resource_embedding_fence import _resource_uri
+
+        resource_admitted = (
+            await get_viking_fs()._capture_resource_identity(ctx)
+            if scope == "resources" and _resource_uri(to or parent or "viking://resources")
+            else None
+        )
         defer_post_processing = bool(kwargs.pop("defer_post_processing", False))
         preacquired_lock = kwargs.pop("resource_lock", None)
         ingest_options = IngestOptions.from_search_tags(tags, mode=tag_mode)
@@ -1021,6 +1028,7 @@ class ResourceProcessor:
             local_artifact_doc_rel = ""
             incremental_noop = False
             context_update_plan = None
+            resource_index_conditions = {}
 
             if root_uri and temp_uri:
                 viking_fs = get_viking_fs()
@@ -1074,6 +1082,21 @@ class ResourceProcessor:
                                 uri=root_uri,
                                 root_is_file=root_is_file,
                             )
+                    if _resource_uri(root_uri):
+                        from openviking.service.account_identity import recheck_account_identity
+
+                        if resource_admitted is None or resource_lock is None:
+                            raise ValueError(
+                                "Resource plan lacks original account admission and ownership"
+                            )
+                        if (
+                            await viking_fs._async_agfs.pathlock_refresh(resource_lock)
+                            != "refreshed"
+                        ):
+                            raise ValueError("Resource planning ownership was lost")
+                        await recheck_account_identity(
+                            viking_fs._account_identity_manager, ctx.account_id, resource_admitted
+                        )
                     if acl is not None:
                         ingest_options = replace(
                             ingest_options,
@@ -1104,6 +1127,17 @@ class ResourceProcessor:
                             source_format=parse_result.source_format,
                         ),
                     )
+                    if _resource_uri(root_uri):
+                        from openviking.storage.queuefs.resource_embedding_fence import (
+                            capture_resource_index_conditions,
+                        )
+
+                        resource_index_conditions = await capture_resource_index_conditions(
+                            context_update_plan.direct_index_actions,
+                            ctx,
+                            resource_admitted,
+                            resource_lock,
+                        )
                     incremental_noop = target_preexisting and context_update_plan.is_noop()
                     temp_uri = root_uri
                     source_committed = True
@@ -1154,6 +1188,10 @@ class ResourceProcessor:
                 "temp_dir_path": parse_result.temp_dir_path,
                 "artifact_ref": prepared_artifact_ref,
                 "source_committed": source_committed,
+                "resource_creation_identity": resource_admitted.creation_identity
+                if resource_admitted
+                else None,
+                "resource_index_conditions": resource_index_conditions,
                 "target_preexisting": target_preexisting,
                 "is_code_repo": parse_result.source_format == "repository",
                 "root_is_file": root_is_file,
@@ -1207,6 +1245,26 @@ class ResourceProcessor:
         from openviking.metrics.datasources.resource import ResourceIngestionEventDataSource
 
         root_uri = str(prepared.get("root_uri") or "")
+        from openviking.storage.queuefs.resource_embedding_fence import _resource_uri
+
+        if _resource_uri(root_uri):
+            from openviking.server.account_stores.models import AccountIdentity
+            from openviking.service.account_identity import recheck_account_identity
+
+            original_identity = prepared.get("resource_creation_identity")
+            if (
+                not isinstance(original_identity, str)
+                or not original_identity
+                or resource_lock is None
+            ):
+                raise ValueError("Cached resource plan lacks original admission and owned coverage")
+            if await get_viking_fs()._async_agfs.pathlock_refresh(resource_lock) != "refreshed":
+                raise ValueError("Prepared resource plan lost ownership")
+            await recheck_account_identity(
+                get_viking_fs()._account_identity_manager,
+                ctx.account_id,
+                AccountIdentity(original_identity, False),
+            )
         temp_uri = prepared.get("temp_uri")
         temp_dir_path = prepared.get("temp_dir_path")
         # Canonical plans contain only final resource URIs. An artifact ref is
@@ -1305,7 +1363,11 @@ class ResourceProcessor:
                 if direct_index_actions:
                     with bind_ingestion_source_type(source_type):
                         await self._enqueue_index_actions(
-                            direct_index_actions, ctx=ctx, ingest_options=ingest_options
+                            direct_index_actions,
+                            ctx=ctx,
+                            ingest_options=ingest_options,
+                            resource_conditions=prepared.get("resource_index_conditions"),
+                            owner_lease_ref=resource_lock,
                         )
 
                 if should_summarize:
@@ -1518,6 +1580,37 @@ class ResourceProcessor:
         ingest_options: IngestOptions | None = None,
         source_contents: Optional[Dict[tuple[str, int], str | bytes]] = None,
         source_metadata: Optional[Dict[str, Any]] = None,
+        resource_conditions=None,
+        owner_lease_ref=None,
+    ) -> int:
+        from contextlib import nullcontext
+
+        from openviking.storage.queuefs.resource_embedding_fence import (
+            bind_resource_index_conditions,
+        )
+
+        binding = (
+            bind_resource_index_conditions(resource_conditions, owner_lease_ref)
+            if resource_conditions is not None
+            else nullcontext()
+        )
+        with binding:
+            return await self._enqueue_index_actions_bound(
+                actions,
+                ctx=ctx,
+                ingest_options=ingest_options,
+                source_contents=source_contents,
+                source_metadata=source_metadata,
+            )
+
+    async def _enqueue_index_actions_bound(
+        self,
+        actions: Any,
+        *,
+        ctx: RequestContext,
+        ingest_options: IngestOptions | None = None,
+        source_contents: Optional[Dict[tuple[str, int], str | bytes]] = None,
+        source_metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
         from collections import Counter
 
@@ -1549,22 +1642,27 @@ class ResourceProcessor:
         telemetry_id = get_current_telemetry().telemetry_id
         action_counts = Counter(action.action.value for action in actions)
         completed_actions = 0
-        delete_ids = [action.record_id for action in actions if action.action == IndexAction.DELETE]
-        if delete_ids:
+        from openviking.storage.queuefs.resource_embedding_fence import _resource_uri
+
+        deletes = [action for action in actions if action.action == IndexAction.DELETE]
+        groups = [[action] for action in deletes if _resource_uri(action.uri)]
+        nonresource = [action for action in deletes if not _resource_uri(action.uri)]
+        if nonresource:
+            groups.append(nonresource)
+        for group in groups:
+            action = group[0]
             message = EmbeddingMsg.for_delete(
-                record_ids=delete_ids,
+                record_ids=[item.record_id for item in group],
                 context_data={
-                    "uri": actions[0].uri,
+                    "uri": action.uri,
+                    "level": action.level,
                     "account_id": ctx.account_id,
                     "owner_user_id": ctx.user.user_id,
                 },
                 telemetry_id=telemetry_id,
             )
-            await _enqueue_embedding_message(
-                embedding_queue,
-                message,
-            )
-            completed_actions += len(delete_ids)
+            await _enqueue_embedding_message(embedding_queue, message)
+            completed_actions += len(group)
         directory_actions: dict[str, dict[int, Any]] = {}
         for action in actions:
             if action.action in {IndexAction.UPSERT, IndexAction.MERGE}:

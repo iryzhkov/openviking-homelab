@@ -204,6 +204,8 @@ class ResourceSemanticMessageWork(SemanticMessageWork):
             )
 
             await recheck_account_identity(fs._account_identity_manager, ctx.account_id, admitted)
+            # Processing-time identity does not prove the original request
+            # lifetime, so cached plan patches/deletes stay fail-closed here.
             self._embedding_producer = ResourceEmbeddingProducer(ctx, admitted, owner)
 
         await run_to_completion(acquire)
