@@ -216,6 +216,11 @@ class SemanticTreeExecutor:
     ):
         self._processor = processor
         self._before_resource_write = before_resource_write
+        from openviking.storage.queuefs.resource_embedding_fence import (
+            get_resource_embedding_producer,
+        )
+
+        self._embedding_producer = get_resource_embedding_producer()
         self._context_type = context_type
         self._ctx = ctx
         self._incremental_update = incremental_update
@@ -530,6 +535,10 @@ class SemanticTreeExecutor:
             await self._run_work_with_context(work)
 
     async def _run_work_with_context(self, work: SemanticTreeWork) -> None:
+        from openviking.storage.queuefs.resource_embedding_fence import (
+            bind_resource_embedding_producer,
+        )
+
         task_context = (
             bind_task_context(
                 self._task_context.task_id,
@@ -545,6 +554,7 @@ class SemanticTreeExecutor:
             bind_telemetry(self._telemetry),
             bind_ingestion_source_type(self._source_type),
             task_context,
+            bind_resource_embedding_producer(self._embedding_producer),
         ):
             await self._run_work_bound(work)
 

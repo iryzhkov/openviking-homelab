@@ -129,6 +129,7 @@ class ResourceSemanticMessageWork(SemanticMessageWork):
         async def acquire() -> None:
             fs = get_viking_fs()
             msg = self.msg
+            admitted = await fs._capture_resource_identity(ctx)
             self.scope = await SemanticLockScope.resolve(
                 msg.lock_handoff, caller_lock=self.caller_lock, refuse_stale=True
             )
@@ -181,19 +182,37 @@ class ResourceSemanticMessageWork(SemanticMessageWork):
                 )
                 if msg.generation_trigger == "content_write":
                     cached_files.update(
-                        uri for kind in ("added", "modified")
+                        uri
+                        for kind in ("added", "modified")
                         for uri in (msg.changes or {}).get(kind, [])
                     )
                 if not cached_files.issubset(msg.file_md5s):
-                    raise ResourceInputConflict("Resource cached inputs lack byte compare conditions")
+                    raise ResourceInputConflict(
+                        "Resource cached inputs lack byte compare conditions"
+                    )
                 for uri, expected in msg.file_md5s.items():
                     raw = await fs.read_file_bytes(uri, ctx=ctx)
                     if not expected or content_md5(raw) != expected:
-                        raise ResourceInputConflict("Resource input bytes changed before processing")
+                        raise ResourceInputConflict(
+                            "Resource input bytes changed before processing"
+                        )
             if not msg.skip_vectorization and get_task_context() is None:
                 raise ResourceInputConflict("Resource vector work requires tracked completion")
+            from openviking.service.account_identity import recheck_account_identity
+            from openviking.storage.queuefs.resource_embedding_fence import (
+                ResourceEmbeddingProducer,
+            )
+
+            await recheck_account_identity(fs._account_identity_manager, ctx.account_id, admitted)
+            self._embedding_producer = ResourceEmbeddingProducer(ctx, admitted, owner)
 
         await run_to_completion(acquire)
+        from openviking.storage.queuefs.resource_embedding_fence import (
+            bind_resource_embedding_producer,
+        )
+
+        self._producer_binding = bind_resource_embedding_producer(self._embedding_producer)
+        self._producer_binding.__enter__()
         return True
 
     async def validate_ownership(self) -> None:
@@ -238,6 +257,11 @@ class ResourceSemanticMessageWork(SemanticMessageWork):
             self.scope.lock = None
             self.scope._owned = False
             self._lock_closed = True
+        finally:
+            binding = getattr(self, "_producer_binding", None)
+            if binding is not None:
+                self._producer_binding = None
+                binding.__exit__(None, None, None)
 
     def failure_result(self, stats: SemanticTreeStats | None) -> ProcessResult | None:
         if stats is not None and stats.failures:

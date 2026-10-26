@@ -53,13 +53,22 @@ def env(tmp_path, monkeypatch):
     def uri_path(uri, ctx=None):
         del ctx
         assert uri.startswith("viking://resources")
-        return "/local/account/resources" + uri[len("viking://resources"):]
+        return "/local/account/resources" + uri[len("viking://resources") :]
 
     def disk_path(uri):
         return tmp_path / uri_path(uri).removeprefix("/local/")
 
+    from openviking.server.account_stores.models import AccountIdentity
+    from openviking.service.account_identity import capture_account_identity
+
+    manager = SimpleNamespace(
+        get_account_identity=AsyncMock(return_value=AccountIdentity("test-creation", False))
+    )
     fs = SimpleNamespace(
-        _async_agfs=agfs, _uri_to_path=uri_path,
+        _account_identity_manager=manager,
+        _capture_resource_identity=lambda ctx: capture_account_identity(manager, ctx.account_id),
+        _async_agfs=agfs,
+        _uri_to_path=uri_path,
         exists=AsyncMock(side_effect=lambda uri, **kwargs: disk_path(uri).exists()),
         read_file_bytes=AsyncMock(side_effect=lambda uri, **kwargs: disk_path(uri).read_bytes()),
     )
@@ -84,7 +93,8 @@ def env(tmp_path, monkeypatch):
         content.write_bytes(b"queued old material")
 
     executor = SimpleNamespace(
-        run=AsyncMock(side_effect=run), get_stats=Mock(return_value=SemanticTreeStats()),
+        run=AsyncMock(side_effect=run),
+        get_stats=Mock(return_value=SemanticTreeStats()),
         stale=False,
     )
     constructor = Mock(return_value=executor)
@@ -94,14 +104,27 @@ def env(tmp_path, monkeypatch):
 
     def message(**kwargs):
         return SemanticMsg(
-            uri=root_uri, context_type="resource", account_id="account",
-            skip_vectorization=True, propagate_to_parent=False, **kwargs
+            uri=root_uri,
+            context_type="resource",
+            account_id="account",
+            skip_vectorization=True,
+            propagate_to_parent=False,
+            **kwargs,
         )
 
     return SimpleNamespace(
-        agfs=agfs, fs=fs, processor=processor, executor=executor, constructor=constructor,
-        resources=resources, target=target, content=content, foreign=foreign,
-        root_uri=root_uri, message=message, writes=writes,
+        agfs=agfs,
+        fs=fs,
+        processor=processor,
+        executor=executor,
+        constructor=constructor,
+        resources=resources,
+        target=target,
+        content=content,
+        foreign=foreign,
+        root_uri=root_uri,
+        message=message,
+        writes=writes,
     )
 
 
@@ -137,9 +160,15 @@ async def test_stale_handoff_preserves_intervening_replacement(env, payload):
         )
     else:
         kwargs["plan"] = SemanticPlan(
-            env.root_uri, "resource", SemanticTreeSnapshot((
-                SemanticTreeEntry("", "directory", ContentState.UNCHANGED, SemanticAction.AGGREGATE),
-            )),
+            env.root_uri,
+            "resource",
+            SemanticTreeSnapshot(
+                (
+                    SemanticTreeEntry(
+                        "", "directory", ContentState.UNCHANGED, SemanticAction.AGGREGATE
+                    ),
+                )
+            ),
         )
     result = await env.processor.on_dequeue(env.message(**kwargs).to_dict())
     assert env.content.read_bytes() == b"replacement must survive"
@@ -167,11 +196,21 @@ async def test_nonresource_scope_keeps_existing_stale_recovery(env):
 @pytest.mark.parametrize("planned", [False, True])
 async def test_live_handoff_still_runs_and_releases(env, planned):
     token = await handoff(env)
-    plan = SemanticPlan(
-        env.root_uri, "resource", SemanticTreeSnapshot((
-            SemanticTreeEntry("", "directory", ContentState.UNCHANGED, SemanticAction.AGGREGATE),
-        )),
-    ) if planned else None
+    plan = (
+        SemanticPlan(
+            env.root_uri,
+            "resource",
+            SemanticTreeSnapshot(
+                (
+                    SemanticTreeEntry(
+                        "", "directory", ContentState.UNCHANGED, SemanticAction.AGGREGATE
+                    ),
+                )
+            ),
+        )
+        if planned
+        else None
+    )
     result = await env.processor.on_dequeue(env.message(lock_handoff=token, plan=plan).to_dict())
     assert result.outcome is ProcessOutcome.SUCCESS
     assert env.writes == [env.root_uri]
@@ -184,7 +223,8 @@ async def test_live_handoff_still_runs_and_releases(env, planned):
 async def test_no_handoff_cached_file_compares_current_bytes_under_tree(env, qualified):
     uri = env.root_uri + "/content.md"
     msg = env.message(
-        generation_trigger="content_write", changes={"modified": [uri]},
+        generation_trigger="content_write",
+        changes={"modified": [uri]},
         file_abstracts={uri: "cached original summary"},
         file_md5s={uri: content_md5(b"original")} if qualified else {},
     )
@@ -211,7 +251,8 @@ async def test_no_handoff_cached_file_compares_current_bytes_under_tree(env, qua
 async def test_matching_md5_is_a_real_compare_guard(env):
     uri = env.root_uri + "/content.md"
     msg = env.message(
-        generation_trigger="content_write", changes={"modified": [uri]},
+        generation_trigger="content_write",
+        changes={"modified": [uri]},
         file_md5s={uri: content_md5(b"original")},
     )
     result = await env.processor.on_dequeue(msg.to_dict())
@@ -274,13 +315,21 @@ async def test_lost_lease_blocks_cached_sidecar_and_file_vector(env, monkeypatch
         _vectorize_single_file=vectors,
     )
     executor = SemanticTreeExecutor(
-        processor=processor, context_type="resource", max_concurrent_llm=1,
-        ctx=ctx, lock=work.scope.lock, before_resource_write=work.validate_ownership,
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=1,
+        ctx=ctx,
+        lock=work.scope.lock,
+        before_resource_write=work.validate_ownership,
     )
     with pytest.raises(ResourceInputConflict, match="ownership was lost"):
         await executor._write_directory_semantics(
-            env.root_uri, "old overview", "old abstract",
-            total_entries=1, sampled_entries=1, consume_pending=0,
+            env.root_uri,
+            "old overview",
+            "old abstract",
+            total_entries=1,
+            sampled_entries=1,
+            consume_pending=0,
         )
     with pytest.raises(ResourceInputConflict, match="ownership was lost"):
         await executor._file_summary_task(env.root_uri, env.root_uri + "/content.md")
@@ -314,7 +363,9 @@ async def test_native_ownership_loss_preserves_foreign_token_and_directory(env):
 
 
 @pytest.mark.parametrize("cancel", [False, True])
-async def test_taskless_refresh_collects_and_drains_vector_work_before_unlock(env, monkeypatch, cancel):
+async def test_taskless_refresh_collects_and_drains_vector_work_before_unlock(
+    env, monkeypatch, cancel
+):
     from openviking.service.task_queue_middleware import TaskWorkQueueMiddleware
     from openviking.service.task_work_index import get_task_context
     from openviking.storage.queuefs.named_queue import NamedQueue
@@ -323,7 +374,9 @@ async def test_taskless_refresh_collects_and_drains_vector_work_before_unlock(en
     backend = SimpleNamespace(mkdir=AsyncMock(), write=AsyncMock(return_value="vector-message"))
     monkeypatch.setattr("openviking.storage.queuefs.named_queue.AsyncAGFSClient", lambda _: backend)
     queue = NamedQueue(
-        object(), "/queue", "Embedding",
+        object(),
+        "/queue",
+        "Embedding",
         dequeue_handler=SimpleNamespace(on_dequeue=AsyncMock(return_value=ProcessResult.success())),
         middlewares=[TaskWorkQueueMiddleware()],
     )
@@ -331,7 +384,9 @@ async def test_taskless_refresh_collects_and_drains_vector_work_before_unlock(en
 
     async def run(uri):
         assert get_task_context() is not None
-        await queue.enqueue({"context_data": {"uri": uri, "account_id": "account", "user_id": "default"}})
+        await queue.enqueue(
+            {"context_data": {"uri": uri, "account_id": "account", "user_id": "default"}}
+        )
         enqueued.set()
 
     env.executor.run.side_effect = run
@@ -346,10 +401,12 @@ async def test_taskless_refresh_collects_and_drains_vector_work_before_unlock(en
     with pytest.raises(LockAcquisitionError):
         await env.agfs.pathlock_acquire_exact("/local/account/resources/contender")
     payload = backend.write.call_args.args[1].decode()
-    backend.read = AsyncMock(side_effect=[
-        json.dumps({"id": "vector-message", "data": payload}).encode(),
-        json.dumps({"pending": 0, "processing": 0}).encode(),
-    ])
+    backend.read = AsyncMock(
+        side_effect=[
+            json.dumps({"id": "vector-message", "data": payload}).encode(),
+            json.dumps({"pending": 0, "processing": 0}).encode(),
+        ]
+    )
     await queue.dequeue()
     if cancel:
         with pytest.raises(asyncio.CancelledError):
@@ -402,7 +459,10 @@ async def test_refusal_marks_actual_task_and_queue_failed(env, monkeypatch):
     backend = SimpleNamespace(mkdir=AsyncMock(), write=AsyncMock(return_value="queue-message"))
     monkeypatch.setattr("openviking.storage.queuefs.named_queue.AsyncAGFSClient", lambda _: backend)
     queue = NamedQueue(
-        object(), "/queue", "Semantic", dequeue_handler=env.processor,
+        object(),
+        "/queue",
+        "Semantic",
+        dequeue_handler=env.processor,
         middlewares=[TaskWorkQueueMiddleware()],
     )
     msg = env.message(
@@ -414,10 +474,12 @@ async def test_refusal_marks_actual_task_and_queue_failed(env, monkeypatch):
     with bind_task_context(task.task_id, msg.account_id, msg.user_id):
         await queue.enqueue(msg.to_dict())
     payload = backend.write.call_args.args[1].decode()
-    backend.read = AsyncMock(side_effect=[
-        json.dumps({"id": "queue-message", "data": payload}).encode(),
-        json.dumps({"pending": 0, "processing": 0}).encode(),
-    ])
+    backend.read = AsyncMock(
+        side_effect=[
+            json.dumps({"id": "queue-message", "data": payload}).encode(),
+            json.dumps({"pending": 0, "processing": 0}).encode(),
+        ]
+    )
     await queue.dequeue()
     status = await queue.get_status()
     assert status.error_count == 1 and status.processed == 0

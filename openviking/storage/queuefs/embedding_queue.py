@@ -22,6 +22,9 @@ class EmbeddingQueue(NamedQueue):
         if msg is None:
             logger.warning("Embedding message is None, skipping enqueuing")
             return ""
+        from .resource_embedding_fence import stamp_resource_embedding
+
+        await stamp_resource_embedding(msg)
         msg.queue_enqueued_at = time.time()
         logger.debug("Enqueued embedding message: uri=%s", msg.context_data.get("uri", ""))
         return await super().enqueue(msg.to_dict())

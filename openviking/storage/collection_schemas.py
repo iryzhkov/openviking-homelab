@@ -36,6 +36,10 @@ from openviking.storage.queuefs.embedding_msg import (
 )
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.process_result import ProcessResult
+from openviking.storage.queuefs.resource_embedding_fence import (
+    is_resource_embedding,
+    resource_embedding_commit,
+)
 from openviking.storage.vector_ids import vector_record_id
 from openviking.storage.viking_vector_index_backend import (
     VIKINGDB_CONTENT_MAX_SIZE,
@@ -708,7 +712,8 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     return ProcessResult.success()
 
                 if embedding_msg.action not in {IndexAction.UPSERT, IndexAction.MERGE}:
-                    result = await self._apply_non_embedding_operation(embedding_msg, ctx)
+                    async with resource_embedding_commit(embedding_msg, ctx, self._vikingdb):
+                        result = await self._apply_non_embedding_operation(embedding_msg, ctx)
                     self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
                     return ProcessResult.success(result)
 
@@ -849,90 +854,98 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
                 # Write to vector database
                 try:
-                    raw_upsert_options = inserted_data.pop("_upsert_options", {})
-                    extracted_memory_type = raw_upsert_options.pop("extracted_memory_type", None)
-                    # Reuse the actual vector-store ID when a semantic plan
-                    # rebuilds an existing same-level record. Only genuinely new
-                    # records derive an ID locally from (account, uri, level).
-                    existing_record_id = inserted_data.pop("_upsert_record_id", None)
-                    uri = inserted_data.get("uri")
-                    if existing_record_id:
-                        inserted_data["id"] = str(existing_record_id)
-                    elif uri:
-                        inserted_data["id"] = vector_record_id(
-                            account_id, uri, inserted_data.get("level", 2)
+                    async with resource_embedding_commit(embedding_msg, ctx, self._vikingdb):
+                        raw_upsert_options = inserted_data.pop("_upsert_options", {})
+                        extracted_memory_type = raw_upsert_options.pop(
+                            "extracted_memory_type", None
                         )
+                        # Reuse the actual vector-store ID when a semantic plan
+                        # rebuilds an existing same-level record. Only genuinely new
+                        # records derive an ID locally from (account, uri, level).
+                        existing_record_id = inserted_data.pop("_upsert_record_id", None)
+                        uri = inserted_data.get("uri")
+                        if existing_record_id:
+                            inserted_data["id"] = str(existing_record_id)
+                        elif uri:
+                            inserted_data["id"] = vector_record_id(
+                                account_id, uri, inserted_data.get("level", 2)
+                            )
 
-                    if await self._vikingdb.account_uses_content_field(account_id):
-                        inserted_data["content"] = await self._materialize_content(
-                            embedding_msg,
-                            ctx,
-                        )
-                    inserted_data.pop("_materialized_content", None)
-                    if embedding_msg.action is IndexAction.MERGE:
-                        field_patch = embedding_msg.field_patch
-                        merge_fields = dict(field_patch.values) if field_patch is not None else {}
-                        merge_modes = dict(field_patch.modes) if field_patch is not None else {}
-                        # Legacy MERGE producers encoded tag intent in context_data
-                        # plus _upsert_options. Normalize them to the explicit patch
-                        # protocol before the exact read.
-                        if "search_tags" in inserted_data and "search_tags" not in merge_fields:
-                            merge_fields["search_tags"] = inserted_data.pop("search_tags")
-                            merge_modes["search_tags"] = str(
-                                raw_upsert_options.get("search_tag_mode", "replace")
+                        if await self._vikingdb.account_uses_content_field(account_id):
+                            inserted_data["content"] = await self._materialize_content(
+                                embedding_msg,
+                                ctx,
                             )
-                        existing_records = await self._vikingdb.get_strict(
-                            [inserted_data["id"]], ctx=ctx
-                        )
-                        base = (
-                            dict(existing_records[0])
-                            if existing_records
-                            else dict(field_patch.seed_fields)
-                            if field_patch is not None
-                            else {}
-                        )
-                        # Fresh content/model outputs win over the stored record;
-                        # scalar patches are then interpreted against that latest
-                        # exact-get result.
-                        inserted_data = FieldPatch(merge_fields, merge_modes).apply(
-                            {**base, **inserted_data}
-                        )
-                        if extracted_memory_type:
-                            inserted_data["search_tags"] = merge_search_tags(
-                                inserted_data.get("search_tags"),
-                                [f"memory_type={extracted_memory_type}"],
+                        inserted_data.pop("_materialized_content", None)
+                        if embedding_msg.action is IndexAction.MERGE:
+                            field_patch = embedding_msg.field_patch
+                            merge_fields = (
+                                dict(field_patch.values) if field_patch is not None else {}
                             )
-                        if not existing_records:
-                            missing_fields = missing_initial_record_fields(inserted_data)
-                            if missing_fields:
-                                raise RuntimeError(
-                                    "merge could not create missing vector record: "
-                                    f"record_id={inserted_data.get('id')} "
-                                    f"missing_fields={missing_fields}"
+                            merge_modes = dict(field_patch.modes) if field_patch is not None else {}
+                            # Legacy MERGE producers encoded tag intent in context_data
+                            # plus _upsert_options. Normalize them to the explicit patch
+                            # protocol before the exact read.
+                            if "search_tags" in inserted_data and "search_tags" not in merge_fields:
+                                merge_fields["search_tags"] = inserted_data.pop("search_tags")
+                                merge_modes["search_tags"] = str(
+                                    raw_upsert_options.get("search_tag_mode", "replace")
                                 )
-                    upsert_options = normalize_upsert_options(
-                        {**raw_upsert_options, "partial_update": False}
-                    )
-                    if inserted_data.get("context_type") == ContextType.SKILL.value:
-                        # Cancelling the waiter cannot stop a threaded DB write.
-                        # Keep this task active until that write has settled.
-                        result = await run_to_completion(
-                            lambda: self._vikingdb.upsert(
-                                inserted_data, ctx=ctx, options=upsert_options
+                            existing_records = await self._vikingdb.get_strict(
+                                [inserted_data["id"]], ctx=ctx
                             )
+                            base = (
+                                dict(existing_records[0])
+                                if existing_records
+                                else dict(field_patch.seed_fields)
+                                if field_patch is not None
+                                else {}
+                            )
+                            # Fresh content/model outputs win over the stored record;
+                            # scalar patches are then interpreted against that latest
+                            # exact-get result.
+                            inserted_data = FieldPatch(merge_fields, merge_modes).apply(
+                                {**base, **inserted_data}
+                            )
+                            if extracted_memory_type:
+                                inserted_data["search_tags"] = merge_search_tags(
+                                    inserted_data.get("search_tags"),
+                                    [f"memory_type={extracted_memory_type}"],
+                                )
+                            if not existing_records:
+                                missing_fields = missing_initial_record_fields(inserted_data)
+                                if missing_fields:
+                                    raise RuntimeError(
+                                        "merge could not create missing vector record: "
+                                        f"record_id={inserted_data.get('id')} "
+                                        f"missing_fields={missing_fields}"
+                                    )
+                        upsert_options = normalize_upsert_options(
+                            {**raw_upsert_options, "partial_update": False}
                         )
-                    else:
-                        result = await self._vikingdb.upsert(
-                            inserted_data,
-                            ctx=ctx,
-                            options=upsert_options,
-                        )
-                    record_id = result
-                    if record_id:
-                        logger.debug(
-                            "Successfully wrote embedding: %s",
-                            self._embedding_delivery_log_context(embedding_msg),
-                        )
+                        if (
+                            is_resource_embedding(embedding_msg)
+                            or inserted_data.get("context_type") == ContextType.SKILL.value
+                        ):
+                            # Cancelling the waiter cannot stop a threaded DB write.
+                            # Keep this task active until that write has settled.
+                            result = await run_to_completion(
+                                lambda: self._vikingdb.upsert(
+                                    inserted_data, ctx=ctx, options=upsert_options
+                                )
+                            )
+                        else:
+                            result = await self._vikingdb.upsert(
+                                inserted_data,
+                                ctx=ctx,
+                                options=upsert_options,
+                            )
+                        record_id = result
+                        if record_id:
+                            logger.debug(
+                                "Successfully wrote embedding: %s",
+                                self._embedding_delivery_log_context(embedding_msg),
+                            )
                 except CollectionNotFoundError as db_err:
                     # During shutdown, queue workers may finish one dequeued item.
                     if self._vikingdb.is_closing:
