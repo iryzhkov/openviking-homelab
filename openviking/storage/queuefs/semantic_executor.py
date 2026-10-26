@@ -1547,6 +1547,7 @@ class SemanticTreeExecutor:
                 return
 
             # Persist sidecars before publishing their directory vectors.
+            written_bodies: Optional[tuple[str, str]] = None
             if should_write:
                 assert overview is not None and abstract is not None
                 try:
@@ -1563,6 +1564,10 @@ class SemanticTreeExecutor:
                         self._root_write_result = write_result
                     if not write_result.wrote:
                         need_vectorize = False
+                    else:
+                        # The exact bodies this task just committed under its
+                        # owned coverage (the sidecar body is the write input).
+                        written_bodies = (abstract, overview)
                 except AbstractOverviewFormatError:
                     raise
                 except Exception as exc:
@@ -1630,6 +1635,18 @@ class SemanticTreeExecutor:
                                 0: content_md5(abstract.encode("utf-8")),
                                 1: content_md5(overview.encode("utf-8")),
                             },
+                        }
+                    if (
+                        self._context_type == "resource"
+                        and "md5s" not in directory_vector_kwargs
+                        and written_bodies is not None
+                    ):
+                        # Resource directory vectors carry the byte condition of
+                        # the sidecars written above; without a write here they
+                        # carry none and the resource fence refuses them.
+                        directory_vector_kwargs["md5s"] = {
+                            0: content_md5(written_bodies[0].encode("utf-8")),
+                            1: content_md5(written_bodies[1].encode("utf-8")),
                         }
                     if self._telemetry_id is not None:
                         directory_vector_kwargs["telemetry_id"] = self._telemetry_id

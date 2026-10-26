@@ -50,6 +50,39 @@ def trace(monkeypatch):
         return await original_enqueue(self, data)
 
     monkeypatch.setattr(NamedQueue, "enqueue", record_enqueue)
+
+    from openviking.service import task_queue_middleware
+
+    original_prepare = task_queue_middleware.prepare_task_payload
+    prepared = []
+
+    def record_prepare(payload):
+        result, metadata = original_prepare(payload)
+        body = result.get("data", result) if isinstance(result, dict) else {}
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except ValueError:
+                body = {}
+        context = (body.get("payload") or {}).get("context_data") or body.get("context_data") or {}
+        prepared.append(
+            {
+                "task_id": metadata.task_id if metadata else None,
+                "work_id": metadata.work_id if metadata else None,
+                "queue_kind": (
+                    "semantic"
+                    if "generation_trigger" in body
+                    else "embedding"
+                    if "payload" in body or "context_data" in body
+                    else "other"
+                ),
+                "uri": str(body.get("uri") or context.get("uri") or "").rstrip("/"),
+            }
+        )
+        return result, metadata
+
+    monkeypatch.setattr(task_queue_middleware, "prepare_task_payload", record_prepare)
+    monkeypatch.setattr(task_queue_middleware, "_e2e_prepared", prepared, raising=False)
     return calls, persisted
 
 
@@ -100,6 +133,13 @@ async def _ingest(service, sample_markdown_file, trace):
         "calls": calls,
         "queues": sorted({name for name, _ in persisted}),
         "semantic_identity": [d.get("resource_creation_identity") for d in semantic],
+        "semantic_tasks": [d.get("task_id") for d in semantic],
+        "embedding_tasks": [d.get("task_id") for d in embedding],
+        "resources_root": {
+            r.get("level"): r.get("abstract")
+            for r in records
+            if str(r.get("uri", "")).rstrip("/") == "viking://resources"
+        },
         "embedding_fenced": ["_resource_fence" in json.dumps(d) for d in embedding],
         "records": sorted((r.get("uri"), r.get("level")) for r in resource_records),
         "bodies": {
@@ -208,6 +248,38 @@ async def test_real_resource_ingest_succeeds_with_root_uri(
     original = await _creation_identity(admitted_service)
     assert set(summary["semantic_identity"]) == {original}, detail
     assert summary["embedding_fenced"] and all(summary["embedding_fenced"]), detail
+    # The derived resources-root parent refresh belongs to the same Task and
+    # published L0/L1 matching the sidecar bodies it wrote.
+    from openviking.service.task_tracker import get_task_tracker
+    from openviking.storage.abstract_overview import body_for_preview
+
+    assert ("viking://resources", "parent_refresh") in [
+        tuple(item) for item in summary["semantic_uris"]
+    ], detail
+    from openviking.service import task_queue_middleware
+
+    prepared = task_queue_middleware._e2e_prepared
+    detail = json.dumps({**summary, "prepared": prepared}, default=str)
+    # Every derived semantic/embedding message, including the parent refresh,
+    # was registered as Work of the one original Task at enqueue time.
+    derived = [item for item in prepared if item["queue_kind"] in {"semantic", "embedding"}]
+    assert derived and all(item["task_id"] for item in derived), detail
+    tasks = {item["task_id"] for item in prepared}
+    assert len(tasks) == 1, detail
+    assert any(item["uri"] == "viking://resources" for item in derived), detail
+    task_id = tasks.pop()
+    fs = admitted_service.viking_fs
+    for level, name in ((0, ".abstract.md"), (1, ".overview.md")):
+        raw = await fs.read_file_bytes("viking://resources/" + name, ctx=_root_ctx())
+        body = body_for_preview(raw).strip()
+        assert body and body in str(summary["resources_root"].get(level) or ""), detail
+    ctx = _root_ctx()
+    tracker = get_task_tracker()
+    assert not await tracker._store.has_open_work(
+        task_id, exclude_work_id=None, account_id=ctx.account_id, user_id=ctx.user.user_id
+    ), detail
+    task = await tracker.get(task_id, account_id=ctx.account_id, user_id=ctx.user.user_id)
+    assert task is not None and task.status.value == "completed", detail
     # No resource-root coverage acquisition was refused by the native manager.
     assert not any(
         event[0] == "pathlock_acquire_batch" and str(event[-1]).startswith("ERR") for event in locks

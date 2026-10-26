@@ -461,8 +461,14 @@ class SemanticProcessor(DequeueHandlerBase):
                 peer_id=msg.peer_id,
             ),
         )
-        with detach_task_context():
+        if msg.context_type == "resource":
+            # Resource parent refresh stays inside the original Task: its Work
+            # is registered now, before the current Work closes, so Task
+            # completion, wait=True and cancellation cover the parent writes.
             await semantic_queue.enqueue(parent_msg)
+        else:
+            with detach_task_context():
+                await semantic_queue.enqueue(parent_msg)
         logger.info("Enqueued parent semantic refresh: %s", parent_uri)
 
     def _message_work(
