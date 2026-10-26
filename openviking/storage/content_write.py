@@ -1431,6 +1431,7 @@ class ContentWriteCoordinator:
         mode: str = "replace",
         recursive: bool = False,
         ctx: RequestContext,
+        lease_ref: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         self._validate_tag_mode(mode)
         normalized_uri = self._validate_uri_path(uri, field_name="uri")
@@ -1442,39 +1443,52 @@ class ContentWriteCoordinator:
             raise InvalidArgumentError(f"tags are not supported for namespace: {normalized_uri}")
         await self._viking_fs._ensure_access(normalized_uri, ctx, action=AclAction.WRITE)
         stat = await self._safe_stat(normalized_uri, ctx=ctx)
-        context_type = context_type_for_uri(normalized_uri)
-        root_uri = await self._resolve_root_uri(normalized_uri, ctx=ctx)
-        if requested_mode == "replace" and not normalized_tags:
-            return self._build_tags_result(
-                uri=normalized_uri,
-                updated_uris=[],
-                skipped_count=1,
-                failed_count=0,
-                root_uri=root_uri,
-                context_type=context_type,
-                tags=normalized_tags,
-                mode=requested_mode,
-            )
-        storage_mode = "replace" if requested_mode == "clear" else requested_mode
-        if stat.get("isDir"):
-            result = await self._set_directory_tags(
-                uri=normalized_uri,
-                tags=normalized_tags,
-                mode=storage_mode,
-                recursive=recursive,
-                ctx=ctx,
-            )
-        else:
-            result = await self._set_single_uri_tags(
-                uri=normalized_uri,
-                tags=normalized_tags,
-                mode=storage_mode,
-                recursive=recursive,
-                ctx=ctx,
-            )
-        result["mode"] = requested_mode
-        result["tags"] = normalized_tags
-        return result
+        path = self._viking_fs._uri_to_path(normalized_uri, ctx=ctx)
+        is_dir = bool(stat.get("isDir"))
+        lease = await self._viking_fs._async_agfs.pathlock_acquire_batch(
+            [{"path": path, "kind": "tree" if is_dir else "exact"}],
+            **({"owner_lease_ref": lease_ref} if lease_ref is not None else {}),
+        )
+        try:
+            await self._viking_fs._ensure_access(normalized_uri, ctx, action=AclAction.WRITE)
+            locked_stat = await self._safe_stat(normalized_uri, ctx=ctx)
+            if bool(locked_stat.get("isDir")) != is_dir:
+                raise OpenVikingError("tag target type changed during acquisition", code="CONFLICT")
+            context_type = context_type_for_uri(normalized_uri)
+            root_uri = await self._resolve_root_uri(normalized_uri, ctx=ctx)
+            if requested_mode == "replace" and not normalized_tags:
+                return self._build_tags_result(
+                    uri=normalized_uri,
+                    updated_uris=[],
+                    skipped_count=1,
+                    failed_count=0,
+                    root_uri=root_uri,
+                    context_type=context_type,
+                    tags=normalized_tags,
+                    mode=requested_mode,
+                )
+            storage_mode = "replace" if requested_mode == "clear" else requested_mode
+            if stat.get("isDir"):
+                result = await self._set_directory_tags(
+                    uri=normalized_uri,
+                    tags=normalized_tags,
+                    mode=storage_mode,
+                    recursive=recursive,
+                    ctx=ctx,
+                )
+            else:
+                result = await self._set_single_uri_tags(
+                    uri=normalized_uri,
+                    tags=normalized_tags,
+                    mode=storage_mode,
+                    recursive=recursive,
+                    ctx=ctx,
+                )
+            result["mode"] = requested_mode
+            result["tags"] = normalized_tags
+            return result
+        finally:
+            await self._viking_fs._async_agfs.pathlock_release(lease)
 
     def _build_write_result(
         self,

@@ -106,7 +106,9 @@ async def test_structured_install_predicts_destination_and_preserves_raw_backup(
     assert result["staging_revision"] == incoming_revision
     assert result["revision"] == await revision(fs, target, ctx)
     assert result["revision"] != incoming_revision
-    assert await revision(fs, backup, ctx) == old_revision
+    # Backup ACL anchors the original effective policy at its new parent;
+    # content bytes below remain exact, while the full metadata revision differs.
+    assert await revision(fs, backup, ctx) != old_revision
     for relative, original in old.items():
         assert await raw(fs, f"{backup}/{relative}", ctx) == original
     for relative, original in incoming.items():

@@ -20,18 +20,31 @@ async def transfer_skill_package(
     ctx: RequestContext,
     lease_ref: Dict[str, Any],
     preserve_sidecar_bytes: bool = False,
+    prepared_index_records: list[Dict[str, Any]] | None = None,
 ) -> None:
-    """Copy files and move existing vectors, leaving both locked roots intact.
+    """Copy files and transfer existing vectors, leaving both locked roots intact.
 
     The caller owns both tree locks and decides when the source can be cleared.
     Recovery copies may preserve sidecar bytes exactly; ordinary transfers keep
-    the existing destination URI/link rewrite by default.
+    the existing destination URI/link rewrite by default. A protected replacement
+    can supply pre-materialized context records; those are copied before files,
+    with source contexts retained. The default vector move path is unchanged.
     Do not use cp/mv here: their failure cleanup can delete the target root,
     which during rollback is the directory holding the live package lock.
     """
     source_uris = await viking_fs._prepare_transfer_entries(
         source_uri, target_uri, is_dir=True, move=True, ctx=ctx
     )
+    if prepared_index_records is not None:
+        # Every payload already has its final ACL. Publish it before file bytes,
+        # retaining the source's contexts and avoiding a permissive move rewrite.
+        store = viking_fs._get_vector_store()
+        if prepared_index_records:
+            if store is None:
+                raise RuntimeError("protected transfer requires the context store")
+            written = await store._upsert_many_raw(prepared_index_records, ctx=ctx)
+            if len(written) != len(prepared_index_records):
+                raise RuntimeError("protected transfer did not publish every context record")
     await viking_fs._copy_directory_under_tree_locks(
         viking_fs._uri_to_path(source_uri, ctx=ctx),
         viking_fs._uri_to_path(target_uri, ctx=ctx),
@@ -41,6 +54,8 @@ async def transfer_skill_package(
         lease_ref=lease_ref,
         **({"rewrite_semantic_sidecars": False} if preserve_sidecar_bytes else {}),
     )
+    if prepared_index_records is not None:
+        return
     # Move preserves the existing vector payloads and compensates on failure.
     # Keep the source files available even if index transfer/restoration fails.
     await viking_fs._update_vector_store_uris(
@@ -54,6 +69,7 @@ async def clear_skill_package_contents(
     *,
     ctx: RequestContext,
     lease_ref: Dict[str, Any],
+    preserve_index: bool = False,
 ) -> None:
     """Remove package entries and root vectors, keeping the root and its lock."""
     root_path = viking_fs._uri_to_path(root_uri, ctx=ctx)
@@ -76,5 +92,7 @@ async def clear_skill_package_contents(
             recursive=bool(entry.get("isDir", False)),
             ctx=ctx,
             lease_ref=lease_ref,
+            **({"no_vector": True} if preserve_index else {}),
         )
-    await viking_fs._delete_from_vector_store([root_uri], ctx=ctx)
+    if not preserve_index:
+        await viking_fs._delete_from_vector_store([root_uri], ctx=ctx)

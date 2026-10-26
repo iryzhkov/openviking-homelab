@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
+from dataclasses import replace
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from openviking.core.context import ContextLevel
@@ -42,7 +44,9 @@ from openviking.storage.abstract_overview import (
     ABSTRACT_OVERVIEW_FILENAMES,
     rewrite_abstract_overview_for_transfer,
 )
-from openviking.storage.acl import AclAction
+from openviking.storage.acl import AclAction, AclMode
+from openviking.storage.vector_migration import rewrite_vector_record
+from openviking.utils.time_utils import get_current_timestamp
 from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
 from openviking.storage.internal_names import is_storage_internal_name
 from openviking.storage.viking_fs import VikingFS
@@ -69,8 +73,125 @@ def _conflict(message: str, **details: Any) -> OpenVikingError:
     return OpenVikingError(message, code="CONFLICT", details=details)
 
 
+
+# Fields derived from content, identity, indexing or inheritance are not user
+# mutation preconditions. Unknown persisted fields remain covered, fail-closed.
+_DERIVED_CONTEXT_FIELDS = {
+    "id", "uri", "level", "vector", "sparse_vector", "created_at", "updated_at",
+    "active_count", "md5", "account_id", "owner_user_id", "owner_space",
+    "context_type", "type", "abstract", "content", "acl_inherited_grants",
+}
+
+
+def _controls(record: Dict[str, Any]) -> Dict[str, Any]:
+    result = {
+        key: deepcopy(value) for key, value in record.items()
+        if key not in _DERIVED_CONTEXT_FIELDS and not key.startswith("_")
+    }
+    result["acl_mode"] = (
+        "restricted" if record.get("acl_mode") == "restricted" else "inherit"
+    )
+    for field in ("acl_direct_grants", "search_tags"):
+        result[field] = sorted(value for value in (record.get(field) or []) if value != "")
+    return result
+
+
+async def _context_records(viking_fs, uri, ctx):
+    store = viking_fs._get_vector_store()
+    if store is None:
+        return []
+    records, _ = await store._scan_uri_transfer_scope(
+        replace(ctx, bypass_acl=True), uri, recursive=True, include_full_records=True
+    )
+    if len(records) > MAX_TREE_ENTRIES * 3:
+        raise ResourceExhaustedError("too many context records for guarded replacement")
+    return deepcopy(records)
+
+
+def _metadata_entry(records, uri):
+    if not records:
+        return []
+    rows = [
+        {"uri": record["uri"][len(uri):], "level": record.get("level", 2),
+         "fields": _controls(record)}
+        for record in records
+    ]
+    rows.sort(key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")))
+    return [{"path": "", "type": "metadata", "records": rows}]
+
+
+def _with_metadata(entries, records, uri):
+    if entries is None:
+        return None
+    return [entry for entry in entries if entry["type"] != "metadata"] + _metadata_entry(records, uri)
+
+
+async def _prepare_context_copy(viking_fs, source, target, records, ctx, *,
+                                retained=None, anchor=None):
+    payloads = [
+        rewrite_vector_record(
+            record, source_uri=source, target_uri=target, ctx=ctx, mode="copy",
+            timestamp=get_current_timestamp(),
+        ) for record in records
+    ]
+    if retained is not None:
+        old = {(record["uri"][len(target):], record.get("level", 2)): record
+               for record in retained}
+        policies = {}
+        for record in retained:
+            key = record["uri"][len(target):]
+            policy = (_controls(record)["acl_mode"], _controls(record)["acl_direct_grants"])
+            if key in policies and policies[key] != policy:
+                raise RuntimeError("inconsistent retained direct ACL records")
+            policies[key] = policy
+        for payload in payloads:
+            key = (payload["uri"][len(target):], payload.get("level", 2))
+            previous = old.get(key)
+            # Staging ACLs are not an authorized target-policy update.
+            mode, grants = policies.get(key[0], ("inherit", []))
+            payload.update(acl_mode=mode, acl_direct_grants=deepcopy(grants))
+            if previous is not None:
+                payload.update(
+                    acl_mode=previous.get("acl_mode", "inherit"),
+                    acl_direct_grants=deepcopy(previous.get("acl_direct_grants") or []),
+                    search_tags=deepcopy(previous.get("search_tags") or []),
+                    tags=previous.get("tags", ""),
+                )
+    if await viking_fs._acl_enabled(ctx):
+        if not any(record["uri"] == target for record in payloads):
+            raise InvalidArgumentError(
+                "ACL-protected replacement requires an indexed root; no safe ACL boundary exists"
+            )
+        manager = viking_fs.acl_manager
+        if manager is None:
+            raise RuntimeError("ACL manager unavailable")
+        kwargs = {}
+        if anchor is not None:
+            kwargs = {"root_direct": anchor.permissions, "root_mode": AclMode.RESTRICTED}
+        _, payloads = await manager.prepare_subtree_records(target, payloads, ctx, **kwargs)
+    return payloads
+
+
+async def _finish_context_copy(viking_fs, uri, expected, ctx):
+    store = viking_fs._get_vector_store()
+    if store is None:
+        if expected:
+            raise RuntimeError("context store disappeared")
+        return
+    keep = {record["id"] for record in expected}
+    current = await _context_records(viking_fs, uri, ctx)
+    obsolete = [record["id"] for record in current if record["id"] not in keep]
+    if obsolete:
+        await store._delete_vector_transfer_ids(ctx, obsolete)
+    if await viking_fs._acl_enabled(ctx):
+        if viking_fs.acl_manager is None:
+            raise RuntimeError("ACL manager unavailable")
+        await viking_fs.acl_manager.refresh_context_subtree(uri, ctx)
+
+
 async def _tree_entries(
-    viking_fs: VikingFS, path: str, fs_ctx: Dict[str, Any] | None
+    viking_fs: VikingFS, path: str, fs_ctx: Dict[str, Any] | None,
+    *, ctx: RequestContext | None = None,
 ) -> List[Dict[str, Any]] | None:
     """Return the visible descendants of ``path`` with their stored bytes' hashes.
 
@@ -125,7 +246,10 @@ async def _tree_entries(
             )
 
     await visit(path, "")
-    return entries
+    real_ctx = viking_fs._ctx_or_default(ctx)
+    uri = viking_fs._path_to_uri(path, ctx=real_ctx).rstrip("/")
+    records = await _context_records(viking_fs, uri, real_ctx)
+    return _with_metadata(entries, records, uri)
 
 
 async def _expected_transfer_entries(
@@ -172,7 +296,8 @@ def revision_of(entries: List[Dict[str, Any]] | None) -> str:
 
     Semantic sidecars (``.abstract.md``, ``.overview.md``, ``.relations.json``)
     are files of the tree and so part of the revision. Metadata held outside the
-    tree (vector records, tags, ACL rows) is not; it is transferred, not hashed.
+    tree is included through its user-controlled context fields. Embeddings,
+    volatile index fields and inherited ACL materialization are excluded.
     """
     if entries is None:
         return ABSENT_REVISION
@@ -187,7 +312,7 @@ def _summary(entries: List[Dict[str, Any]] | None) -> Dict[str, Any]:
     return {
         "exists": True,
         "files": len(files),
-        "directories": len(entries) - len(files),
+        "directories": sum(entry["type"] == "dir" for entry in entries),
         "bytes": sum(entry["size"] for entry in files),
     }
 
@@ -223,7 +348,10 @@ async def tree_revision(
     except LockAcquisitionError as exc:
         raise ResourceBusyError(f"tree is busy: {uri}", uri=uri) from exc
     try:
-        entries = await _tree_entries(viking_fs, path, viking_fs._pathlock_fs_ctx(ctx, lease))
+        await viking_fs._ensure_access(uri, ctx, action=AclAction.READ)
+        entries = await _tree_entries(
+            viking_fs, path, viking_fs._pathlock_fs_ctx(ctx, lease), ctx=ctx
+        )
     finally:
         await viking_fs._async_agfs.pathlock_release(lease)
     return {"uri": uri, "revision": revision_of(entries), **_summary(entries)}
@@ -296,7 +424,7 @@ async def replace_tree(
     fs_ctx = viking_fs._pathlock_fs_ctx(ctx, lease)
 
     async def read(path: str) -> List[Dict[str, Any]] | None:
-        return await _tree_entries(viking_fs, path, fs_ctx)
+        return await _tree_entries(viking_fs, path, fs_ctx, ctx=ctx)
 
     async def remove_placeholder(path: str) -> None:
         entries = await read(path)
@@ -315,6 +443,9 @@ async def replace_tree(
     }
     try:
         # -- preconditions under the lease, before any change --------------
+        await viking_fs._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
+        await viking_fs._ensure_access(staging_uri, ctx, action=AclAction.MANAGE)
+        await viking_fs._ensure_access(backup_uri, ctx, action=AclAction.WRITE)
         staging_entries = await read(staging_path)
         staging_revision = revision_of(staging_entries)
         target_entries = await read(target_path)
@@ -338,14 +469,48 @@ async def replace_tree(
                 target_uri=target_uri,
                 current_revisions=problems,
             )
+        original_records = await _context_records(viking_fs, target_uri, ctx)
+        staging_records = await _context_records(viking_fs, staging_uri, ctx)
+        # Context-only/orphan entries also have user policies; filesystem-only
+        # traversal cannot authorize their mutation.
+        await viking_fs._ensure_access_many(
+            [record["uri"] for record in original_records + staging_records],
+            ctx, action=AclAction.MANAGE,
+        )
+        # If staging lacks a tagged/direct-policy record at a retained entry,
+        # there is no qualified metadata-only record representation here.
+        incoming = {(record["uri"][len(staging_uri):], record.get("level", 2))
+                    for record in staging_records}
+        retained_paths = {"", *(f"/{entry['path']}" for entry in staging_entries or []
+                               if entry["type"] in {"file", "dir"})}
+        for record in original_records:
+            relative = record["uri"][len(target_uri):]
+            fields = _controls(record)
+            if relative in retained_paths and (relative, record.get("level", 2)) not in incoming:
+                if (fields["search_tags"] or fields.get("tags")
+                        or fields["acl_direct_grants"] or fields["acl_mode"] == "restricted"):
+                    raise InvalidArgumentError("staging lacks an indexed retained metadata entry")
+        anchor = None
+        if target_entries is not None and await viking_fs._acl_enabled(ctx):
+            anchor = await viking_fs.acl_manager.resolve(target_uri, ctx)
+        backup_records = (
+            await _prepare_context_copy(
+                viking_fs, target_uri, backup_uri, original_records, ctx, anchor=anchor
+            ) if target_entries is not None else []
+        )
+        target_records = await _prepare_context_copy(
+            viking_fs, staging_uri, target_uri, staging_records, ctx,
+            retained=original_records,
+        )
+        expected_backup = revision_of(_with_metadata(target_entries, backup_records, backup_uri))
         state["previous_revision"] = target_revision
         state["revision"] = staging_revision
-        expected_installed = revision_of(
+        expected_installed = revision_of(_with_metadata(
             await _expected_transfer_entries(
                 viking_fs, staging_uri, target_uri, staging_entries, fs_ctx,
                 source_path=staging_path,
-            )
-        )
+            ), target_records, target_uri,
+        ))
 
         # -- 1. copy the old tree to the backup and verify it --------------
         backup_verified = False
@@ -355,9 +520,11 @@ async def replace_tree(
                 await transfer_skill_package(
                     viking_fs, target_uri, backup_uri, ctx=ctx, lease_ref=lease,
                     preserve_sidecar_bytes=True,
+                    prepared_index_records=backup_records,
                 )
+                await _finish_context_copy(viking_fs, backup_uri, backup_records, ctx)
             backup_verified = target_entries is None or (
-                revision_of(await read(backup_path)) == target_revision
+                revision_of(await read(backup_path)) == expected_backup
             )
             if not backup_verified:
                 raise RuntimeError("backup copy does not match the target revision")
@@ -365,14 +532,17 @@ async def replace_tree(
             await step("clear_target")
             if target_entries:
                 await clear_skill_package_contents(
-                    viking_fs, target_uri, ctx=ctx, lease_ref=lease
+                    viking_fs, target_uri, ctx=ctx, lease_ref=lease,
+                    preserve_index=True,
                 )
             elif await read(target_path) is None:
                 await viking_fs._async_agfs.mkdir(target_path, fs_ctx=fs_ctx)
             await step("install")
             await transfer_skill_package(
-                viking_fs, staging_uri, target_uri, ctx=ctx, lease_ref=lease
+                viking_fs, staging_uri, target_uri, ctx=ctx, lease_ref=lease,
+                prepared_index_records=target_records,
             )
+            await _finish_context_copy(viking_fs, target_uri, target_records, ctx)
             installed = revision_of(await read(target_path))
             if installed != expected_installed:
                 raise RuntimeError("installed target does not match the destination-aware manifest")
@@ -390,6 +560,8 @@ async def replace_tree(
                 ctx=ctx,
                 lease=lease,
                 fs_ctx=fs_ctx,
+                original_records=original_records,
+                backup_revision=expected_backup,
             )
             raise AssertionError("unreachable")  # _recover always raises
         state["content_committed"] = True
@@ -399,7 +571,9 @@ async def replace_tree(
         try:
             await step("cleanup")
             if revision_of(await read(staging_path)) == staging_revision:
+                # Keep restrictive contexts until all source bytes are gone.
                 await viking_fs._async_agfs.rm(staging_path, recursive=True, fs_ctx=fs_ctx)
+                await _finish_context_copy(viking_fs, staging_uri, [], ctx)
             else:
                 cleanup["retained"].append(staging_uri)
             if not target_entries:
@@ -407,8 +581,9 @@ async def replace_tree(
                 await remove_placeholder(backup_path)
             elif retain_backup:
                 cleanup["retained"].append(backup_uri)
-            elif revision_of(await read(backup_path)) == target_revision:
-                await viking_fs.rm(backup_uri, recursive=True, ctx=ctx, lease_ref=lease)
+            elif revision_of(await read(backup_path)) == expected_backup:
+                await viking_fs._async_agfs.rm(backup_path, recursive=True, fs_ctx=fs_ctx)
+                await _finish_context_copy(viking_fs, backup_uri, [], ctx)
             else:
                 cleanup["retained"].append(backup_uri)
         except Exception as exc:
@@ -440,6 +615,8 @@ async def _recover(
     ctx: RequestContext,
     lease: Dict[str, Any],
     fs_ctx: Dict[str, Any] | None,
+    original_records: List[Dict[str, Any]] | None = None,
+    backup_revision: str | None = None,
 ) -> None:
     """Restore the old tree from the verified backup, never deleting a copy blindly."""
     target_path, staging_path, backup_path = paths
@@ -468,7 +645,7 @@ async def _recover(
         try:
             if backup_entries is _UNREADABLE_TREE:
                 details["index_restore_failure"] = "backup_unreadable"
-            elif backup_entries:
+            elif backup_entries and original_records is None:
                 await viking_fs._update_vector_store_uris(
                     backup_uri, target_uri, recursive=True, ctx=ctx
                 )
@@ -482,15 +659,32 @@ async def _recover(
     elif backup_verified or target_entries is None:
         try:
             if previous == ABSENT_REVISION:
-                await clear_skill_package_contents(viking_fs, target_uri, ctx=ctx, lease_ref=lease)
+                await clear_skill_package_contents(
+                    viking_fs, target_uri, ctx=ctx, lease_ref=lease,
+                    **({"preserve_index": True} if original_records is not None else {}),
+                )
+                if original_records is not None:
+                    await _finish_context_copy(viking_fs, target_uri, [], ctx)
             else:
-                if revision_of(await read(backup_path)) != previous:
+                if revision_of(await read(backup_path)) != (backup_revision or previous):
                     raise RuntimeError("backup changed before restoration")
-                await clear_skill_package_contents(viking_fs, target_uri, ctx=ctx, lease_ref=lease)
+                await clear_skill_package_contents(
+                    viking_fs, target_uri, ctx=ctx, lease_ref=lease,
+                    **({"preserve_index": True} if original_records is not None else {}),
+                )
+                restored_records = original_records
+                if restored_records is not None and await viking_fs._acl_enabled(ctx):
+                    _, restored_records = await viking_fs.acl_manager.prepare_subtree_records(
+                        target_uri, restored_records, ctx
+                    )
                 await transfer_skill_package(
                     viking_fs, backup_uri, target_uri, ctx=ctx, lease_ref=lease,
                     preserve_sidecar_bytes=True,
+                    **({"prepared_index_records": restored_records}
+                       if restored_records is not None else {}),
                 )
+                if restored_records is not None:
+                    await _finish_context_copy(viking_fs, target_uri, restored_records, ctx)
             restored = revision_of(await read(target_path))
             accepted = (
                 (ABSENT_REVISION, revision_of([])) if previous == ABSENT_REVISION else (previous,)
@@ -512,7 +706,10 @@ async def _recover(
     details["retained"] = retained
     details["target_revision"] = _reported_revision(await _safe_read(read, target_path))
     # File content is restored from copies; index records may need the native reindex.
-    details["index_status"] = "reindex_recommended"
+    details["index_status"] = (
+        "restored" if original_records is not None
+        and details["state"] in {"rolled_back", "target_unchanged"} else "recovery_required"
+    )
     code = "INTERNAL" if details["state"] in ("rolled_back", "target_unchanged") else "DATA_LOSS"
     raise OpenVikingError(
         f"tree replacement failed; {details['state']}",

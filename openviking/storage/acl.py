@@ -486,7 +486,7 @@ class AclManager:
             direct, inherited, mode=mode, parent_mode=parent_acl.mode
         ).context_fields()
 
-    async def _apply_subtree(
+    async def prepare_subtree_records(
         self,
         root_uri: str,
         records: Sequence[dict[str, Any]],
@@ -494,7 +494,8 @@ class AclManager:
         *,
         root_direct: DirectAcl | None = None,
         root_mode: AclMode | None = None,
-    ) -> EffectiveAcl:
+    ) -> tuple[EffectiveAcl, list[dict[str, Any]]]:
+        """Materialize the existing subtree ACL rules before publishing records."""
         grouped = self._group_by_uri(records)
         if root_uri not in grouped:
             raise InvalidArgumentError("ACL target has no context record; index it first")
@@ -535,10 +536,24 @@ class AclManager:
             for record in records
             if str(record.get("uri") or "") in effective_by_uri
         ]
+        return effective_by_uri[root_uri], updated
+
+    async def _apply_subtree(
+        self,
+        root_uri: str,
+        records: Sequence[dict[str, Any]],
+        ctx: RequestContext,
+        *,
+        root_direct: DirectAcl | None = None,
+        root_mode: AclMode | None = None,
+    ) -> EffectiveAcl:
+        effective, updated = await self.prepare_subtree_records(
+            root_uri, records, ctx, root_direct=root_direct, root_mode=root_mode
+        )
         ids = await self._context_store._upsert_many_raw(updated, ctx=ctx)
         if len(ids) != len(updated):
             raise RuntimeError(f"Failed to update {len(updated) - len(ids)} context ACL record(s)")
-        return effective_by_uri[root_uri]
+        return effective
 
     async def refresh_context_subtree(self, uri: str, ctx: RequestContext) -> None:
         records = await self._subtree_records(uri, ctx)
