@@ -379,12 +379,13 @@ class AddResourceProcessor(DequeueHandlerBase):
                         queue_summary.get("embedding", {}),
                     )
 
-                await self._resource_service._link_resource_reason_memory(
-                    result=result,
-                    ctx=ctx,
-                    reason=msg.reason,
-                    source_name=msg.source_name,
-                )
+                if (msg.prepared or {}).get("resources_only_document") is not True:
+                    await self._resource_service._link_resource_reason_memory(
+                        result=result,
+                        ctx=ctx,
+                        reason=msg.reason,
+                        source_name=msg.source_name,
+                    )
                 await self._record_watch_execution(msg, "completed")
                 await tracker.complete(
                     msg.task_id,

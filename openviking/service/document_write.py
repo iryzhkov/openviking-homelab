@@ -63,6 +63,11 @@ ACTION_LIMIT = 384
 CONTROL_PREFIX = "file-controls-v1-sha256:"
 
 
+class _DocumentIntent(RequestIntent):
+    def required_vector_fields(self):
+        return super().required_vector_fields() | {"search_tags", "tags"}
+
+
 class _Closed(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -585,7 +590,7 @@ async def _write_document(service, request, ctx, *, fault):
                 records = await _target_records(fs, uri, inventory, original, root_is_file, ctx)
                 await _preflight_effects(fs, uri, inventory, original, records, root_is_file, ctx)
                 target = AgfsResourceTarget(viking_fs=fs, root_uri=uri, ctx=ctx, lease_ref=lease)
-                intent = RequestIntent.from_ingest_options(
+                intent = _DocumentIntent.from_ingest_options(
                     target_uri=uri,
                     processing_mode="semantic_and_vectors",
                     ingest_options=IngestOptions(),
@@ -743,6 +748,7 @@ async def _write_document(service, request, ctx, *, fault):
                         "temp_dir_path": None,
                         "artifact_ref": None,
                         "source_committed": True,
+                        "resources_only_document": True,
                         "resource_creation_identity": admitted.creation_identity,
                         "resource_index_conditions": conditions,
                         "target_preexisting": original.node["kind"] != "absent",

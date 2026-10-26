@@ -108,6 +108,36 @@ async def test_http_private_parser_and_contract(admitted_service, app, client, m
         for row in records
     )
 
+    observed = (await document_node(service, TARGET, ctx))["node"]
+    changed = dict(observed, tree_revision="tree-sha256:" + "0" * 64)
+    with pytest.raises(ConflictError):
+        await write_document(
+            service,
+            DocumentWriteRequest(
+                target_uri=TARGET,
+                source_name="replacement.md",
+                text="replacement",
+                expected=changed,
+                backup_uri=BACKUP,
+            ),
+            ctx,
+        )
+    replaced = await write_document(
+        service,
+        DocumentWriteRequest(
+            target_uri=TARGET,
+            source_name="replacement.md",
+            text="# Replacement\n\nNew directory document.\n",
+            expected=observed,
+            backup_uri=BACKUP,
+        ),
+        ctx,
+    )
+    assert replaced["node"]["kind"] == "directory"
+    assert replaced["backup"]["node"]["kind"] == "directory"
+    assert replaced["processing_state"] == "accepted"
+    await settle(service)
+
 
 async def test_raw_preservation_and_protected_backup(admitted_service, monkeypatch):
     service = admitted_service
@@ -229,12 +259,16 @@ async def test_stale_controls_and_same_process_rollback(admitted_service, monkey
         assert (await document_node(service, TARGET, ctx))["node"] == expected
         assert (await document_node(service, BACKUP, ctx))["node"]["kind"] == "absent"
 
+    phases = []
+
     async def fault(phase):
+        phases.append(phase)
         if phase == "install":
             raise OSError("injected install failure")
 
     with pytest.raises(OpenVikingError) as raised:
         await write_document(service, request, ctx, fault=fault)
+    assert "install" in phases
     assert raised.value.details["content_state"] == "rolled_back", raised.value.details
     assert raised.value.details["retained_copies"][0]["uri"] == BACKUP
     assert (await document_node(service, TARGET, ctx))["node"] == expected
