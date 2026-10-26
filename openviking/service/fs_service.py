@@ -1406,6 +1406,8 @@ class FSService:
                     from_uri, to_uri, ctx, move=True, owner_lease_ref=coverage
                 ) as lease:
                     options = {"lease_ref": lease} if lease is not None else {}
+                    if qualified:
+                        options["resource_admission"] = admitted
                     if vector_mode != "transfer":
                         options.update(
                             vector_mode=vector_mode,

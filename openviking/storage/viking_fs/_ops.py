@@ -827,6 +827,7 @@ class _OpsMixin:
         vector_mode: Literal["transfer", "delete_source", "none"] = "transfer",
         copy_semantic_sidecars: bool = True,
         no_replace: bool = False,
+        resource_admission=None,
     ) -> Dict[str, Any]:
         """Move file/directory while extending an optional outer pathlock lease.
 
@@ -862,7 +863,15 @@ class _OpsMixin:
         resource_scope = no_replace and (
             self._is_shared_resource_uri(old_uri) or self._is_shared_resource_uri(new_uri)
         )
-        admitted = await self._capture_resource_identity(ctx) if resource_scope else None
+        admitted = resource_admission
+        if resource_scope:
+            if admitted is None:
+                admitted = await self._capture_resource_identity(ctx)
+            elif (
+                lease_ref is None
+                or await self._async_agfs.pathlock_refresh(lease_ref) != "refreshed"
+            ):
+                raise ConflictError("Qualified move lost its original admitted owner")
         # Verify source exists and determine type before locking.
         try:
             stat = await self._async_agfs.stat(old_path)
@@ -957,6 +966,23 @@ class _OpsMixin:
             uris_to_move = await self._prepare_transfer_entries(
                 old_uri, new_uri, is_dir=is_dir, move=True, ctx=ctx
             )
+
+            if resource_scope and acl_enabled:
+                from openviking.storage.prepared_resource_move import move_prepared_resource
+
+                return await move_prepared_resource(
+                    self,
+                    source=old_uri,
+                    target=new_uri,
+                    ctx=ctx,
+                    admitted=admitted,
+                    lease=lease,
+                    is_dir=is_dir,
+                    physical_uris=uris_to_move,
+                    vector_mode=vector_mode,
+                    copy_semantic_sidecars=copy_semantic_sidecars,
+                    operation_id=operation_id,
+                )
 
             if no_replace and is_dir:
                 await self._mkdir_transfer_root_exclusive(new_path, new_uri, ctx, lease)
@@ -1072,7 +1098,23 @@ class _OpsMixin:
             )
             return result
         finally:
-            await self._async_agfs.pathlock_release(lease)
+            try:
+                await self._async_agfs.pathlock_release(lease)
+            except ValueError as exc:
+                if not (
+                    resource_scope
+                    and acl_enabled
+                    and any(
+                        text in str(exc)
+                        for text in (
+                            "owned lease capability does not match",
+                            "unknown pathlock lease ref",
+                        )
+                    )
+                ):
+                    raise
+                # A revoked capability cannot release its replacement owner.
+                # Preserve the protected move outcome without fresh cleanup.
 
     async def _copy_for_mv(
         self,
