@@ -5,6 +5,7 @@
 from openviking.server.error_mapping import is_not_found_error, map_exception
 from openviking.server.identity import RequestContext
 from openviking.storage.acl import AclAction
+from openviking.storage.expr import And, Eq
 from openviking.storage.internal_names import is_storage_internal_name
 from openviking.storage.viking_fs import VikingFS
 from openviking.utils.path_safety import validate_safe_viking_uri_path
@@ -80,6 +81,17 @@ async def maintain_resource(
                     raise ConflictError("Orphan pruning requires an absent resource")
                 if viking_fs._get_vector_store() is None:
                     raise FailedPreconditionError("Resource index is unavailable")
+                # rm also deletes the trailing-slash spelling. The native ACL
+                # resolver cannot qualify its separate persisted policy. Detect
+                # even ACL-hidden aliases in this account, then refuse all roles.
+                backend = await viking_fs._get_vector_store().get_account_backend(ctx.account_id)
+                aliases = await backend.strict_query(
+                    filter=And([Eq("account_id", ctx.account_id), Eq("uri", uri + "/")]),
+                    limit=1,
+                    output_fields=["uri"],
+                )
+                if aliases:
+                    raise FailedPreconditionError("Trailing-slash index records cannot be qualified")
             else:
                 if fresh is None:
                     raise NotFoundError(uri)

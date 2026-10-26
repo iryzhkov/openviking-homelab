@@ -201,12 +201,13 @@ async def test_exact_orphan_prune_keeps_descendants_siblings_and_foreign_account
     await seed(backend, uri + "/child", ctx, "descendant")
     await seed(backend, uri + "-sibling", ctx, "sibling")
     await seed(backend, uri, foreign, "foreign")
+    await seed(backend, uri + "/", foreign, "foreign-slash")
     result = await FSService(fs).prune_resource_index(uri, ctx)
     assert result == {"uri": uri, "outcome": "pruned"}
     assert not await fs.exists(uri, ctx=ctx)
     assert not await backend.get(["orphan"], ctx=ctx)
     assert await backend.get(["descendant", "sibling"], ctx=ctx)
-    assert await backend.get(["foreign"], ctx=foreign)
+    assert len(await backend.get(["foreign", "foreign-slash"], ctx=foreign)) == 2
 
 
 @pytest.mark.parametrize("kind", ["file", "directory", "empty_directory", "stale_absence"])
@@ -447,6 +448,48 @@ async def test_actual_owner_coverage_loss_after_index_delete_has_no_success(
         [{"path": fs._uri_to_path("viking://resources", ctx=ctx), "kind": "tree"}]
     )
     await release(lease)
+
+
+async def test_prune_alias_query_failure_is_not_absence(enabled_tree, monkeypatch):
+    fs, backend, ctx, target, *_ = enabled_tree
+    uri = target + "/orphan"
+    await seed(backend, uri, ctx)
+    account_backend = await backend.get_account_backend(ctx.account_id)
+    original = account_backend.strict_query
+    async def fail_eligibility(*args, **kwargs):
+        if kwargs.get("limit") == 1 and kwargs.get("output_fields") == ["uri"]:
+            raise OSError("injected alias eligibility failure")
+        return await original(*args, **kwargs)
+    monkeypatch.setattr(account_backend, "strict_query", fail_eligibility)
+    deletion = AsyncMock(wraps=fs._delete_from_vector_store)
+    monkeypatch.setattr(fs, "_delete_from_vector_store", deletion)
+    with pytest.raises(OpenVikingError) as error:
+        await FSService(fs).prune_resource_index(uri, ctx)
+    assert error.value.details["outcome"] == "not_started"
+    deletion.assert_not_called()
+    assert await backend.get(["orphan"], ctx=ctx)
+
+
+@pytest.mark.parametrize("root", [False, True])
+async def test_orphan_slash_rows_are_ineligible_even_for_root(enabled_tree, root):
+    fs, backend, ctx, target, *_ = enabled_tree
+    user = ctx if root else RequestContext(
+        user=UserIdentifier(ctx.account_id, "maintainer"), role=Role.USER,
+    )
+    owner = {"principal": "user:" + ctx.user.user_id, "level": "manage"}
+    await fs.set_acl(
+        target, [owner, {"principal": "user:maintainer", "level": "manage"}],
+        ctx=ctx, acl_mode=AclMode.RESTRICTED,
+    )
+    uri = target + "/orphan"
+    await seed(backend, uri, ctx, "canonical")
+    await seed(backend, uri + "/", ctx, "slash")
+    with pytest.raises(OpenVikingError) as error:
+        await FSService(fs).prune_resource_index(uri, user)
+    assert error.value.code == "FAILED_PRECONDITION"
+    assert error.value.details["outcome"] == "not_started"
+    assert len(await backend.get(["canonical", "slash"], ctx=ctx)) == 2
+    assert not await fs.exists(uri, ctx=ctx)
 
 
 @pytest.mark.parametrize("operation", ["remove", "prune"])
