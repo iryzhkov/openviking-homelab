@@ -107,6 +107,15 @@ async def _call(site, service, case, ctx=None):
     return await service.mv(target, MOVED, ctx, no_replace=True)
 
 
+async def _call_committed(site, service, case):
+    """Run an admitted call; batch-write's post-commit enqueue has no queue here."""
+    try:
+        await _call(site, service, case)
+    except RuntimeError as exc:
+        if site != "batch" or "QueueManager is not initialized" not in str(exc):
+            raise
+
+
 async def _assert_untouched(site, case, watch_bytes):
     fs, backend, ctx, target, *_ = case
     assert await raw(fs, WATCH_TASK_STORAGE_URI, ctx) == watch_bytes
@@ -176,7 +185,7 @@ async def test_unrelated_watch_does_not_gate(enabled_tree, monkeypatch, site, va
         else _watch(ctx, primary, account_id="other-account")
     )
     service, manager, _, _, watch_bytes = await _harness(enabled_tree, monkeypatch, [watch])
-    await _call(site, service, enabled_tree)
+    await _call_committed(site, service, enabled_tree)
     # The qualified path never writes watch state, even on success.
     assert await raw(fs, WATCH_TASK_STORAGE_URI, ctx) == watch_bytes
     if site == "remove":
@@ -231,10 +240,16 @@ async def test_watch_control_state_is_never_maintained(enabled_tree, monkeypatch
 async def test_executing_tick_delays_mutation_which_is_then_refused(
     enabled_tree, monkeypatch, site
 ):
+    """The authoritative check runs under the mutation lease.
+
+    No watch exists at admission, so mv's fast pre-check passes and mv takes
+    native coverage first. A tick holding the access lease creates the watch
+    before it ends; every call site must then refuse.
+    """
     fs, backend, ctx, target, *_ = enabled_tree
     watch = _watch(ctx, target)
-    service, _, _, coordinator, watch_bytes = await _harness(
-        enabled_tree, monkeypatch, [watch]
+    service, manager, _, coordinator, watch_bytes = await _harness(
+        enabled_tree, monkeypatch, []
     )
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -251,6 +266,7 @@ async def test_executing_tick_delays_mutation_which_is_then_refused(
     await asyncio.sleep(0.3)
     assert not mutation.done()
     await _assert_untouched(site, enabled_tree, watch_bytes)
+    manager._tasks[watch.task_id] = watch
     release.set()
     await ticking
     with pytest.raises(OpenVikingError) as error:
@@ -311,7 +327,7 @@ async def test_cancelled_ingestion_gates_until_its_write_settles(enabled_tree, m
     assert write_returned.is_set()
     settled = await tracker.get(task.task_id, account_id=ctx.account_id, user_id=owner)
     assert settled.status.value == "cancelled"
-    await _call(site, service, enabled_tree)
+    await _call_committed(site, service, enabled_tree)
 
 
 async def test_unfinished_ingestion_without_known_target_fails_closed(enabled_tree, monkeypatch):

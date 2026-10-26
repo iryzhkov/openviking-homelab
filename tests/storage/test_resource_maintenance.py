@@ -41,6 +41,20 @@ from tests.storage.test_tree_replace_structured import (
 enabled_tree = _enabled_tree
 
 
+@pytest.fixture(autouse=True)
+def installed_task_tracker(request, monkeypatch):
+    """Install the shared Task tracker, as the service does before serving.
+
+    The watch eligibility gate reads unfinished ingestion Tasks and fails
+    closed without a tracker.
+    """
+    if "indexed_fs" not in request.fixturenames:
+        return
+    fs, _ = request.getfixturevalue("indexed_fs")
+    tracker = TaskTracker(PersistentTaskStore(fs._async_agfs))
+    monkeypatch.setattr("openviking.service.task_tracker._instance", tracker)
+
+
 async def seed(backend, uri, ctx, key="orphan"):
     await backend.upsert(
         {
