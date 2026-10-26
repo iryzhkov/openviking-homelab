@@ -1015,6 +1015,7 @@ class _OpsMixin:
         transfer_source_uri: str | None = None,
         transfer_target_uri: str | None = None,
         copy_semantic_sidecars: bool = True,
+        rewrite_semantic_sidecars: bool = True,
     ) -> int:
         """Copy a directory under the operation's source and target Tree leases.
 
@@ -1023,6 +1024,8 @@ class _OpsMixin:
             new_path: Destination backend directory path.
             ctx: Request context used for filesystem operations.
             lease_ref: Batch lease covering the source and destination subtrees.
+            rewrite_semantic_sidecars: Retarget generated sidecars by default.
+                False is reserved for a lossless recovery copy.
 
         Returns:
             Number of created directories and files.
@@ -1068,11 +1071,12 @@ class _OpsMixin:
                     transfer_source_uri=transfer_source_uri,
                     transfer_target_uri=transfer_target_uri,
                     copy_semantic_sidecars=copy_semantic_sidecars,
+                    rewrite_semantic_sidecars=rewrite_semantic_sidecars,
                 )
             else:
-                if name in ABSTRACT_OVERVIEW_FILENAMES:
-                    if not copy_semantic_sidecars:
-                        continue
+                if name in ABSTRACT_OVERVIEW_FILENAMES and not copy_semantic_sidecars:
+                    continue
+                if name in ABSTRACT_OVERVIEW_FILENAMES and rewrite_semantic_sidecars:
                     raw = await self._async_agfs.cat(old_child, fs_ctx=fs_ctx)
                     level = (
                         ContextLevel.ABSTRACT if name == ".abstract.md" else ContextLevel.OVERVIEW

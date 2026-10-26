@@ -17,8 +17,9 @@ Guarantee, stated exactly:
 * The steps are not crash-atomic and not invisible to readers: a reader can see
   the target empty or partially installed while the lease is held. The old
   tree is copied to the backup and verified by revision before the target is
-  cleared, and staging is never cleared before the installed target matches its
-  revision, so a complete copy of each tree exists at every step.
+  cleared. Staging is never cleared before the installed target matches the
+  predicted destination manifest, including rewritten structured sidecars.
+  The input revisions always describe the original raw bytes.
 * On a failure the old tree is restored from the verified backup when
   possible. Copies are never deleted on a failure path; the error reports the
   retained locations.
@@ -30,11 +31,16 @@ import hashlib
 import json
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from openviking.core.context import ContextLevel
 from openviking.server.error_mapping import is_not_found_error
 from openviking.server.identity import RequestContext
 from openviking.server.skill_package_update import (
     clear_skill_package_contents,
     transfer_skill_package,
+)
+from openviking.storage.abstract_overview import (
+    ABSTRACT_OVERVIEW_FILENAMES,
+    rewrite_abstract_overview_for_transfer,
 )
 from openviking.storage.acl import AclAction
 from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
@@ -120,6 +126,45 @@ async def _tree_entries(
 
     await visit(path, "")
     return entries
+
+
+async def _expected_transfer_entries(
+    viking_fs: VikingFS,
+    source_uri: str,
+    target_uri: str,
+    entries: List[Dict[str, Any]] | None,
+    fs_ctx: Dict[str, Any] | None,
+    *,
+    source_path: str,
+) -> List[Dict[str, Any]]:
+    """Predict exactly the existing copy helper's destination sidecar bytes."""
+    if entries is None:
+        raise _conflict("staging tree disappeared before transfer", uri=source_uri)
+    expected: List[Dict[str, Any]] = []
+    for entry in entries:
+        copied = dict(entry)
+        relative = entry["path"]
+        parent, _, name = relative.rpartition("/")
+        if entry["type"] == "file" and name in ABSTRACT_OVERVIEW_FILENAMES:
+            raw = await viking_fs._async_agfs.cat(f"{source_path}/{relative}", fs_ctx=fs_ctx)
+            data = bytes(raw) if isinstance(raw, (bytes, bytearray)) else str(raw).encode("utf-8")
+            if hashlib.sha256(data).hexdigest() != entry["sha256"]:
+                raise _conflict("staging sidecar changed while predicting transfer", uri=source_uri)
+            old_dir = f"{source_uri}/{parent}" if parent else source_uri
+            new_dir = f"{target_uri}/{parent}" if parent else target_uri
+            rewritten = rewrite_abstract_overview_for_transfer(
+                data,
+                level=ContextLevel.ABSTRACT if name == ".abstract.md" else ContextLevel.OVERVIEW,
+                source_dir_uri=old_dir,
+                target_dir_uri=new_dir,
+                source_scope_uri=source_uri,
+                target_scope_uri=target_uri,
+            ).encode("utf-8")
+            copied.update(size=len(rewritten), sha256=hashlib.sha256(rewritten).hexdigest())
+        expected.append(copied)
+    if sum(entry.get("size", 0) for entry in expected) > MAX_TREE_BYTES:
+        raise ResourceExhaustedError("rewritten tree exceeds replacement byte limit")
+    return expected
 
 
 def revision_of(entries: List[Dict[str, Any]] | None) -> str:
@@ -295,6 +340,12 @@ async def replace_tree(
             )
         state["previous_revision"] = target_revision
         state["revision"] = staging_revision
+        expected_installed = revision_of(
+            await _expected_transfer_entries(
+                viking_fs, staging_uri, target_uri, staging_entries, fs_ctx,
+                source_path=staging_path,
+            )
+        )
 
         # -- 1. copy the old tree to the backup and verify it --------------
         backup_verified = False
@@ -302,7 +353,8 @@ async def replace_tree(
             await step("backup")
             if target_entries:
                 await transfer_skill_package(
-                    viking_fs, target_uri, backup_uri, ctx=ctx, lease_ref=lease
+                    viking_fs, target_uri, backup_uri, ctx=ctx, lease_ref=lease,
+                    preserve_sidecar_bytes=True,
                 )
             backup_verified = target_entries is None or (
                 revision_of(await read(backup_path)) == target_revision
@@ -322,8 +374,10 @@ async def replace_tree(
                 viking_fs, staging_uri, target_uri, ctx=ctx, lease_ref=lease
             )
             installed = revision_of(await read(target_path))
-            if installed != staging_revision:
-                raise RuntimeError("installed target does not match the staging revision")
+            if installed != expected_installed:
+                raise RuntimeError("installed target does not match the destination-aware manifest")
+            state["staging_revision"] = staging_revision
+            state["revision"] = installed
         except Exception as failure:
             await _recover(
                 viking_fs,
@@ -434,7 +488,8 @@ async def _recover(
                     raise RuntimeError("backup changed before restoration")
                 await clear_skill_package_contents(viking_fs, target_uri, ctx=ctx, lease_ref=lease)
                 await transfer_skill_package(
-                    viking_fs, backup_uri, target_uri, ctx=ctx, lease_ref=lease
+                    viking_fs, backup_uri, target_uri, ctx=ctx, lease_ref=lease,
+                    preserve_sidecar_bytes=True,
                 )
             restored = revision_of(await read(target_path))
             accepted = (

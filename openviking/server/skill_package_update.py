@@ -19,10 +19,13 @@ async def transfer_skill_package(
     *,
     ctx: RequestContext,
     lease_ref: Dict[str, Any],
+    preserve_sidecar_bytes: bool = False,
 ) -> None:
     """Copy files and move existing vectors, leaving both locked roots intact.
 
     The caller owns both tree locks and decides when the source can be cleared.
+    Recovery copies may preserve sidecar bytes exactly; ordinary transfers keep
+    the existing destination URI/link rewrite by default.
     Do not use cp/mv here: their failure cleanup can delete the target root,
     which during rollback is the directory holding the live package lock.
     """
@@ -36,6 +39,7 @@ async def transfer_skill_package(
         new_uri=target_uri,
         ctx=ctx,
         lease_ref=lease_ref,
+        **({"rewrite_semantic_sidecars": False} if preserve_sidecar_bytes else {}),
     )
     # Move preserves the existing vector payloads and compensates on failure.
     # Keep the source files available even if index transfer/restoration fails.
