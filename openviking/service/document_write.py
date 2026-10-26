@@ -5,6 +5,7 @@ No import/watch controls and no persisted journal. Rollback is same-process only
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -353,7 +354,10 @@ async def _preflight_effects(fs, uri, inventory, old, records, root_is_file, ctx
     old_nodes = len(old.entries) + (1 if old.node["kind"] == "directory" else 0)
     if new_nodes + old_nodes + 2 * len(ancestors) > FORMAL_LIMIT:
         raise ResourceExhaustedError("Document operation formal-node limit exceeded")
-    if len(old.records) + len(records) > RECORD_LIMIT:
+    backup_anchor = int(
+        old.node["kind"] != "absent" and not any(row["uri"] == uri for row in old.records)
+    )
+    if len(old.records) + len(records) + backup_anchor > RECORD_LIMIT:
         raise ResourceExhaustedError("Document operation context limit exceeded")
     metadata_roots = set(ancestors) | {row["uri"] for row in records if row["level"] in {0, 1}}
     effects = [*ancestors]
@@ -450,6 +454,34 @@ async def _prepare(service, request, private, ctx):
         if await store.read_bytes(ref, rel) != request.text.encode():
             raise FailedPreconditionError("Exact document input was transformed")
     return store, ref, doc_rel, root_is_file, inventory
+
+
+async def _embed_private_records(fs, records, root_uri, bodies, ctx, admitted, lease):
+    """Use the configured embedder before any formal policy/body publication."""
+    for record in records:
+        if record.get("vector") is not None:
+            continue
+        relative = record["uri"][len(root_uri) :].lstrip("/")
+        if record["level"] == 2:
+            raw = bodies[relative]
+        else:
+            raw = b"\n".join(
+                value
+                for path, value in sorted(bodies.items())
+                if not relative or path == relative or path.startswith(relative + "/")
+            )
+        if len(raw) > MAX_TEXT_BYTES:
+            raise ResourceExhaustedError("Private policy embedding input limit exceeded")
+        await _live(fs, ctx, admitted, lease)
+        embedded = await asyncio.to_thread(
+            fs.query_embedder.embed,
+            record["uri"] + "\n" + raw.decode("utf-8", errors="replace"),
+            is_query=False,
+        )
+        await _live(fs, ctx, admitted, lease)
+        if not embedded.dense_vector:
+            raise FailedPreconditionError("Private policy embedding failed")
+        record["vector"] = embedded.dense_vector
 
 
 async def _copy_snapshot(fs, source, destination, old, records, ctx, lease):
@@ -595,6 +627,22 @@ async def _write_document(service, request, ctx, *, fault):
                     )
                 if planned > ACTION_LIMIT:
                     raise ResourceExhaustedError("Document index-action limit exceeded")
+                artifact_bodies = {
+                    rel: await store.read_bytes(ref, path)
+                    for rel, path in inventory.artifact_paths.items()
+                    if not inventory.entries[rel].is_dir
+                }
+                if sum(map(len, artifact_bodies.values())) > MAX_TEXT_BYTES:
+                    raise ResourceExhaustedError("Private artifact embedding limit exceeded")
+                if (
+                    original.node["kind"] != "absent"
+                    and not any(row["uri"] == uri for row in original.records)
+                    and sum(map(len, original.bodies.values())) > MAX_TEXT_BYTES
+                ):
+                    raise ResourceExhaustedError("Unindexed backup embedding limit exceeded")
+                await _embed_private_records(
+                    fs, records, uri, artifact_bodies, ctx, admitted, lease
+                )
                 await step("prepared")
                 if (await _snapshot(fs, uri, ctx, lease)).node != original.node:
                     raise ConflictError("Document expectation changed")
@@ -620,6 +668,15 @@ async def _write_document(service, request, ctx, *, fault):
                         ctx,
                         root_direct=anchor.permissions,
                         root_mode=AclMode.RESTRICTED,
+                    )
+                    await _embed_private_records(
+                        fs,
+                        backup_records,
+                        request.backup_uri,
+                        original.bodies,
+                        ctx,
+                        admitted,
+                        lease,
                     )
                     await step("backup")
                     backup_started = True
@@ -780,6 +837,8 @@ async def _write_document(service, request, ctx, *, fault):
                 {"uri": request.backup_uri, "node": backup.node if backup else None}
             ]
         if not mutated and isinstance(failure, OpenVikingError):
+            failure.message = "Document precondition failed"
+            failure.args = (failure.message,)
             failure.details = details
             raise
         raise OpenVikingError(

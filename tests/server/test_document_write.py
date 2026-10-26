@@ -100,7 +100,13 @@ async def test_http_private_parser_and_contract(admitted_service, app, client, m
     assert seen == [HINT]
     await settle(service)
     records, _ = await service.viking_fs._get_vector_store().scroll(limit=200, ctx=ctx)
-    assert any(row.get("uri", "").startswith(TARGET) and row.get("level") == 2 for row in records)
+    assert any(
+        row.get("uri", "").startswith(TARGET)
+        and row.get("level") == 2
+        and row.get("abstract")
+        and row.get("md5")
+        for row in records
+    )
 
 
 async def test_raw_preservation_and_protected_backup(admitted_service, monkeypatch):
@@ -193,7 +199,7 @@ async def test_file_to_verbatim_and_root_controls(admitted_service):
     assert roots and all(row["search_tags"] == ["owner=old"] for row in roots)
 
 
-async def test_stale_controls_and_same_process_rollback(admitted_service):
+async def test_stale_controls_and_same_process_rollback(admitted_service, monkeypatch):
     service = admitted_service
     ctx = _root_ctx()
     expected = await seed_file(service)
@@ -211,6 +217,17 @@ async def test_stale_controls_and_same_process_rollback(admitted_service):
             service, request.model_copy(update={"expected": type(request.expected)(**changed)}), ctx
         )
     assert (await document_node(service, BACKUP, ctx))["node"]["kind"] == "absent"
+
+    def fail_embedding(*args, **kwargs):
+        raise RuntimeError("injected private embedding failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(type(service.viking_fs.query_embedder), "embed", fail_embedding)
+        with pytest.raises(OpenVikingError) as embedding_error:
+            await write_document(service, request, ctx)
+        assert embedding_error.value.details["content_state"] == "not_started"
+        assert (await document_node(service, TARGET, ctx))["node"] == expected
+        assert (await document_node(service, BACKUP, ctx))["node"]["kind"] == "absent"
 
     async def fault(phase):
         if phase == "install":
