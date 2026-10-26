@@ -72,9 +72,7 @@ class ContentWriteProcessor(DequeueHandlerBase):
 
     async def _reacquire_lock(self, msg: ContentWriteMsg, ctx: RequestContext) -> Dict[str, Any]:
         covered_paths = (
-            msg.lock_handoff.get("covered_paths")
-            if isinstance(msg.lock_handoff, dict)
-            else None
+            msg.lock_handoff.get("covered_paths") if isinstance(msg.lock_handoff, dict) else None
         )
         if isinstance(covered_paths, list) and covered_paths:
             return await self._viking_fs._async_agfs.pathlock_acquire_batch(covered_paths)
@@ -90,6 +88,12 @@ class ContentWriteProcessor(DequeueHandlerBase):
     async def _load_lock(self, msg: ContentWriteMsg, ctx: RequestContext) -> Dict[str, Any] | None:
         if msg.lock_handoff is None:
             return None
+        from openviking.service.content_write_admission import recheck_content_write_admission
+
+        proof = await recheck_content_write_admission(self._viking_fs, msg, ctx)
+        if proof is not None:
+            # Resource work must keep its original owner; never reacquire.
+            return await self._viking_fs._async_agfs.pathlock_adopt(msg.lock_handoff)
         try:
             return await self._viking_fs._async_agfs.pathlock_adopt(msg.lock_handoff)
         except Exception as handoff_error:
@@ -153,7 +157,16 @@ class ContentWriteProcessor(DequeueHandlerBase):
             payload = json.loads(payload)
         msg = ContentWriteMsg.from_dict(payload)
         ctx = self._ctx(msg)
+        from openviking.service.content_write_admission import recheck_content_write_admission
+
         tracker = get_task_tracker()
+        try:
+            await recheck_content_write_admission(self._viking_fs, msg, ctx)
+        except Exception as exc:
+            await tracker.fail(
+                msg.task_id, str(exc), account_id=ctx.account_id, user_id=ctx.user.user_id
+            )
+            return ProcessResult.failed(str(exc))
         task = await tracker.get(
             msg.task_id,
             account_id=ctx.account_id,
@@ -174,14 +187,11 @@ class ContentWriteProcessor(DequeueHandlerBase):
         )
 
         metadata = extract_task_metadata(data)
-        dispatch_complete = (
-            metadata is not None
-            and await tracker.is_enqueue_complete(
-                msg.task_id,
-                metadata.work_id,
-                account_id=ctx.account_id,
-                user_id=ctx.user.user_id,
-            )
+        dispatch_complete = metadata is not None and await tracker.is_enqueue_complete(
+            msg.task_id,
+            metadata.work_id,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
         )
         lock_guard = PathLockGuard(self._viking_fs._async_agfs)
         if not dispatch_complete or (
@@ -209,7 +219,9 @@ class ContentWriteProcessor(DequeueHandlerBase):
         try:
             result_updates: Dict[str, Any] = {}
             checkpoint_result = (
-                deepcopy(task.result) if dispatch_complete and isinstance(task.result, dict) else None
+                deepcopy(task.result)
+                if dispatch_complete and isinstance(task.result, dict)
+                else None
             )
             if not dispatch_complete:
                 if lock_guard.lease is not None and msg.lock_scope == "semantic_handoff":
@@ -230,18 +242,21 @@ class ContentWriteProcessor(DequeueHandlerBase):
                     with bind_telemetry(telemetry):
                         return await execute_refresh()
 
-                if semantic_lock_handoff is None:
-                    refresh_result = await dispatch_refresh()
-                else:
-                    refresh_result = await lock_guard.handoff_and_dispatch(
-                        semantic_lock_handoff,
-                        dispatch_refresh,
-                        accepted=lambda value: (
-                            isinstance(value, tuple)
-                            and len(value) == 2
-                            and bool(value[1])
-                        ),
-                    )
+                from openviking.service.content_write_admission import bind_content_write_admission
+
+                async with bind_content_write_admission(
+                    self._viking_fs, msg, ctx, lock_guard.lease
+                ):
+                    if semantic_lock_handoff is None:
+                        refresh_result = await dispatch_refresh()
+                    else:
+                        refresh_result = await lock_guard.handoff_and_dispatch(
+                            semantic_lock_handoff,
+                            dispatch_refresh,
+                            accepted=lambda value: (
+                                isinstance(value, tuple) and len(value) == 2 and bool(value[1])
+                            ),
+                        )
                 if (
                     isinstance(refresh_result, tuple)
                     and len(refresh_result) == 2

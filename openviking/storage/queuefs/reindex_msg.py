@@ -26,6 +26,11 @@ class ReindexMsg:
     telemetry_id: Optional[str] = None
     lock_handoff: Optional[Dict[str, Any]] = None
     lock_handoff_retry: int = 0
+    resource_creation_identity: str = ""
+
+    def __post_init__(self):
+        if not isinstance(self.resource_creation_identity, str):
+            raise ValueError("Resource reindex identity must be a string")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -65,4 +70,5 @@ class ReindexMsg:
             if isinstance(data.get("lock_handoff"), dict)
             else None,
             lock_handoff_retry=lock_handoff_retry,
+            resource_creation_identity=data.get("resource_creation_identity", ""),
         )

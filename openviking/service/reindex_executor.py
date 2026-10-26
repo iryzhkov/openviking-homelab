@@ -122,6 +122,7 @@ class _ReindexRunContext:
     ingest_options: IngestOptions | None = None
     force: bool = False
     root_is_dir: bool | None = None
+    resource_creation_identity: str = ""
 
 
 @dataclass
@@ -231,6 +232,11 @@ class ReindexExecutor:
             tag_mode=tag_mode,
         )
 
+        from openviking.storage.queuefs.resource_embedding_fence import _resource_uri
+
+        admitted = None
+        if _resource_uri(uri) and task_id is None:
+            admitted = await get_service().viking_fs._capture_resource_identity(ctx)
         tracker = get_task_tracker()
         task = await tracker.create_if_no_running(
             REINDEX_TASK_TYPE,
@@ -271,6 +277,10 @@ class ReindexExecutor:
         enqueued = False
         try:
             service = get_service()
+            if _resource_uri(uri) and admitted is None:
+                raise InvalidArgumentError(
+                    "Resource reindex resubmission requires its original queued admission"
+                )
             path = service.viking_fs._uri_to_path(uri, ctx=ctx)
             stat = await service.viking_fs.stat(uri, ctx=ctx, skip_count=True)
             acquire = (
@@ -280,6 +290,11 @@ class ReindexExecutor:
             )
             lease = await acquire(path)
             lock_guard = PathLockGuard(service.viking_fs._async_agfs, lease)
+            if admitted is not None:
+                coverage = await service.viking_fs._acquire_resource_coverage(
+                    ctx, admitted, owner_lease_ref=lease
+                )
+                await PathLockGuard(service.viking_fs._async_agfs, coverage).close()
             handoff = await lock_guard.to_handoff()
             msg = ReindexMsg(
                 task_id=task.task_id,
@@ -298,6 +313,7 @@ class ReindexExecutor:
                 bypass_acl=ctx.bypass_acl,
                 telemetry_id=get_current_telemetry().telemetry_id or None,
                 lock_handoff=handoff,
+                resource_creation_identity=admitted.creation_identity if admitted else "",
             )
             queue_manager = get_queue_manager()
 
@@ -626,6 +642,7 @@ class ReindexExecutor:
         ingest_options: IngestOptions | None = None,
         ctx: RequestContext,
         existing_lease: dict | None = None,
+        resource_creation_identity: str = "",
     ) -> dict[str, Any]:
         service = get_service()
         if service.viking_fs is None or service.vikingdb_manager is None:
@@ -637,6 +654,25 @@ class ReindexExecutor:
                 details={"uri": uri},
             )
 
+        from openviking.service.account_identity import AccountIdentity, recheck_account_identity
+        from openviking.storage.queuefs.resource_embedding_fence import (
+            ResourceEmbeddingConflict,
+            _resource_uri,
+        )
+
+        if _resource_uri(uri):
+            if not isinstance(resource_creation_identity, str) or not resource_creation_identity:
+                raise ResourceEmbeddingConflict("Resource reindex lacks original request identity")
+            try:
+                await recheck_account_identity(
+                    service.viking_fs._account_identity_manager,
+                    ctx.account_id,
+                    AccountIdentity(resource_creation_identity, False),
+                )
+            except BaseException:
+                if existing_lease is not None:
+                    await PathLockGuard(service.viking_fs._async_agfs, existing_lease).close()
+                raise
         path = service.viking_fs._uri_to_path(uri, ctx=ctx)
         started_at = time.perf_counter()
         counters = _ReindexCounters()
@@ -650,6 +686,15 @@ class ReindexExecutor:
         lease_guard = PathLockGuard(service.viking_fs._async_agfs, lease)
         run: _ReindexRunContext | None = None
         try:
+            if _resource_uri(uri):
+                if await service.viking_fs._async_agfs.pathlock_refresh(lease) != "refreshed":
+                    raise ResourceEmbeddingConflict("Resource reindex lost original owner")
+                coverage = await service.viking_fs._acquire_resource_coverage(
+                    ctx,
+                    AccountIdentity(resource_creation_identity, False),
+                    owner_lease_ref=lease,
+                )
+                await PathLockGuard(service.viking_fs._async_agfs, coverage).close()
             borrowed = (
                 await service.viking_fs._async_agfs.pathlock_as_borrowed(lease)
                 if lease is not None
@@ -665,6 +710,7 @@ class ReindexExecutor:
                 force=force,
                 root_is_dir=root_is_dir,
                 lock_root_uri=uri.rstrip("/"),
+                resource_creation_identity=resource_creation_identity,
             )
             if object_type == "global_namespace":
                 namespace_kwargs = {"uri": uri, "mode": mode, "run": run}
@@ -823,6 +869,17 @@ class ReindexExecutor:
                 )
         run.counters.scanned_records += len(snapshot.formal.entries)
         if plan.direct_index_actions:
+            from openviking.storage.queuefs.resource_embedding_fence import (
+                ResourceEmbeddingConflict,
+                _resource_uri,
+            )
+
+            if _resource_uri(uri):
+                # A queued reindex has no request-time per-action conditions.
+                # Original account admission alone cannot authorize these actions.
+                raise ResourceEmbeddingConflict(
+                    "Resource reindex index actions require original per-action conditions"
+                )
             owner_ctx = self._content_owner_ctx(uri, run.ctx)
             delete_actions = tuple(
                 action for action in plan.direct_index_actions if action.action.value == "delete"
@@ -947,12 +1004,42 @@ class ReindexExecutor:
             if not acquired_plan_lease and run.lease_guard is not None
             else PathLockGuard(agfs, plan_lease)
         )
-        handoff = await plan_guard.to_handoff()
-        msg.lock_handoff = handoff
+        from contextlib import nullcontext
+
+        from openviking.service.account_identity import AccountIdentity, recheck_account_identity
+        from openviking.storage.queuefs.resource_embedding_fence import (
+            _resource_uri,
+            bind_resource_semantic_admission,
+        )
+
+        try:
+            binding = nullcontext()
+            if _resource_uri(semantic_plan.root_uri):
+                if await agfs.pathlock_refresh(plan_lease) != "refreshed":
+                    raise ValueError("Resource reindex lost original ownership")
+                await recheck_account_identity(
+                    viking_fs._account_identity_manager,
+                    owner_ctx.account_id,
+                    AccountIdentity(run.resource_creation_identity, False),
+                )
+                binding = bind_resource_semantic_admission(
+                    owner_ctx.account_id, run.resource_creation_identity
+                )
+            handoff = await plan_guard.to_handoff()
+            msg.lock_handoff = handoff
+        except BaseException:
+            if acquired_plan_lease:
+                await plan_guard.close()
+            raise
+
+        async def enqueue_bound():
+            with binding:
+                return await semantic_queue.enqueue(msg)
+
         try:
             enqueue_id = await plan_guard.handoff_and_dispatch(
                 handoff,
-                lambda: semantic_queue.enqueue(msg),
+                enqueue_bound,
                 accepted=lambda result: result != "deduplicated",
             )
             if enqueue_id == "deduplicated":

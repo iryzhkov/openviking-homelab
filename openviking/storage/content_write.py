@@ -692,8 +692,9 @@ class ContentWriteCoordinator:
             operation.get("expected_absent") or operation.get("expected_sha256") is not None
             for operation in operations
         )
-        admitted = (await self._viking_fs._capture_resource_identity(ctx)
-                    if qualified_resource else None)
+        admitted = (
+            await self._viking_fs._capture_resource_identity(ctx) if qualified_resource else None
+        )
         await self._validate_batch_root(normalized_root, ctx=ctx)
         normalized_operations = await self._normalize_batch_operations(
             normalized_root, operations, ctx=ctx
@@ -725,7 +726,9 @@ class ContentWriteCoordinator:
         try:
             if qualified_resource:
                 lease = await self._viking_fs._acquire_resource_coverage(
-                    ctx, admitted, requests=[{"path": path, "kind": "exact"} for path in target_paths],
+                    ctx,
+                    admitted,
+                    requests=[{"path": path, "kind": "exact"} for path in target_paths],
                 )
             else:
                 lease = await self._viking_fs._async_agfs.pathlock_acquire_exact_batch(target_paths)
@@ -756,7 +759,10 @@ class ContentWriteCoordinator:
                 uri = operation["uri"]
                 if qualified_resource:
                     await self._viking_fs._ensure_access(uri, ctx, action=AclAction.WRITE)
-                    if operation.get("expected_absent") or operation.get("expected_sha256") is not None:
+                    if (
+                        operation.get("expected_absent")
+                        or operation.get("expected_sha256") is not None
+                    ):
                         await self._viking_fs._ensure_transfer_parent_directory(
                             self._viking_fs._uri_to_path(uri, ctx=ctx), uri, operation="batch-write"
                         )
@@ -1939,8 +1945,18 @@ class ContentWriteCoordinator:
                 root_task_factory=root_task_factory,
             )
 
+        from openviking.storage.queuefs.resource_embedding_fence import _resource_uri
+
+        admitted = (
+            await self._viking_fs._capture_resource_identity(ctx) if _resource_uri(uri) else None
+        )
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
         acquire_lock = self._viking_fs._async_agfs.pathlock_acquire_exact
+        if admitted is not None:
+            # The semantic unit is the direct parent, including its sidecars.
+            # Own that unit before mutation so its handoff covers every effect.
+            lock_path = lock_path.rsplit("/", 1)[0]
+            acquire_lock = self._viking_fs._async_agfs.pathlock_acquire_tree
         try:
             lease = await acquire_lock(lock_path)
         except LockAcquisitionError as exc:
@@ -1985,16 +2001,46 @@ class ContentWriteCoordinator:
                 ingest_options=ingest_options,
             )
 
-            await self._commit_content(
-                [uri],
-                lease,
-                lambda: execute_content_tree_actions(
-                    prepared.plan.content_tree_actions,
-                    store=prepared.store,
-                    artifact_ref=prepared.artifact_ref,
-                    target=prepared.target,
-                ),
-            )
+            resource_admission = None
+            coverage_guard = PathLockGuard(self._viking_fs._async_agfs)
+            try:
+                if admitted is not None:
+                    await coverage_guard.acquire(
+                        lambda: self._viking_fs._acquire_resource_coverage(
+                            ctx, admitted, owner_lease_ref=lease
+                        )
+                    )
+                await self._commit_content(
+                    [uri],
+                    lease,
+                    lambda: execute_content_tree_actions(
+                        prepared.plan.content_tree_actions,
+                        store=prepared.store,
+                        artifact_ref=prepared.artifact_ref,
+                        target=prepared.target,
+                    ),
+                )
+            finally:
+                await coverage_guard.close()
+            if admitted is not None:
+                from openviking.service.account_identity import recheck_account_identity
+                from openviking.storage.queuefs.resource_embedding_fence import (
+                    capture_resource_index_conditions,
+                )
+
+                if await self._viking_fs._async_agfs.pathlock_refresh(lease) != "refreshed":
+                    raise ValueError("Resource content write lost original ownership")
+                await recheck_account_identity(
+                    self._viking_fs._account_identity_manager, ctx.account_id, admitted
+                )
+                conditions = await capture_resource_index_conditions(
+                    prepared.plan.direct_index_actions, ctx, admitted, lease
+                )
+                resource_admission = {
+                    "creation_identity": admitted.creation_identity,
+                    "owner": dict(lease),
+                    "index_conditions": conditions,
+                }
             has_async_work = bool(
                 prepared.plan.direct_index_actions or prepared.plan.file_refresh is not None
             )
@@ -2039,6 +2085,10 @@ class ContentWriteCoordinator:
                 # it after durable root dispatch, so Semantic can acquire its
                 # own package lock without inheriting a conflicting lease.
                 lock_scope = "dispatch" if context_type == "skill" else "descendants"
+                if resource_admission is not None:
+                    refresh["resource_admission"] = resource_admission
+                    if prepared.plan.file_refresh is not None:
+                        lock_scope = "semantic_handoff"
                 if has_async_work and lock_scope != "dispatch":
                     lock_handoff = await lock_guard.to_handoff()
                 else:
