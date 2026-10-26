@@ -2,6 +2,7 @@
 
 import json
 import os
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,10 +35,24 @@ async def captured_filters(uris):
     compiler = object.__new__(LocalCollectionAdapter)
     assert not vars(compiler)
     compiled = [compiler._compile_filter(expr) for expr in filters]
-    target = Path(os.environ["PROOF_OUT"]) / "filters.json"
-    evidence = json.loads(target.read_text()) if target.exists() else []
-    evidence.append({"requested": uris, "compiled": compiled, "effects": "capture_only"})
-    target.write_text(json.dumps(evidence, indent=2) + "\n")
+    proof_out = os.environ.get("PROOF_OUT")
+    if proof_out:
+        directory = Path(proof_out)
+        directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix="filters-",
+            suffix=".json",
+            dir=directory,
+            delete=False,
+        ) as target:
+            json.dump(
+                {"requested": uris, "compiled": compiled, "effects": "capture_only"},
+                target,
+                indent=2,
+            )
+            target.write("\n")
     return ctx, filters, compiled
 
 
