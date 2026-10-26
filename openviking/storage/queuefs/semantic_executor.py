@@ -6,7 +6,18 @@ import asyncio
 import re
 import threading
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Mapping, Optional, Set
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    ClassVar,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Set,
+)
 from weakref import WeakKeyDictionary
 
 from openviking.core.namespace import classify_uri
@@ -201,8 +212,10 @@ class SemanticTreeExecutor:
         source_contents: Optional[Mapping[tuple[str, int], str | bytes]] = None,
         source_raw_contents: Optional[Mapping[tuple[str, int], str | bytes]] = None,
         materialize_content: bool = False,
+        before_resource_write: Optional[Callable[[], Awaitable[None]]] = None,
     ):
         self._processor = processor
+        self._before_resource_write = before_resource_write
         self._context_type = context_type
         self._ctx = ctx
         self._incremental_update = incremental_update
@@ -356,7 +369,7 @@ class SemanticTreeExecutor:
         }
 
     def _record_skill_failure(self, uri: str, error: Exception) -> None:
-        if self._context_type == "skill":
+        if self._context_type in {"skill", "resource"}:
             self._stats.failures.append(f"{uri}: {error}")
 
     async def run(self, root_uri: str) -> None:
@@ -1209,6 +1222,8 @@ class SemanticTreeExecutor:
                     vectorize_kwargs["action"] = slot.action.value if slot is not None else "upsert"
                 elif action := self._file_vector_actions.get(file_path.rstrip("/")):
                     vectorize_kwargs["action"] = action
+                if self._before_resource_write is not None:
+                    await self._before_resource_write()
                 enqueued = await self._processor._vectorize_single_file(
                     parent_uri=parent_uri,
                     context_type=self._context_type,
@@ -1384,6 +1399,8 @@ class SemanticTreeExecutor:
         source_root = self._semantic_resource_root or self._root_uri
         if dir_uri == source_root and self._source:
             metadata["source"] = self._source
+        if self._before_resource_write is not None:
+            await self._before_resource_write()
         wrote = await self._await_write(
             write_abstract_overview(
                 viking_fs=self._viking_fs,
@@ -1607,6 +1624,8 @@ class SemanticTreeExecutor:
                     if self._telemetry_id is not None:
                         directory_vector_kwargs["telemetry_id"] = self._telemetry_id
                     if include_abstract or include_overview:
+                        if self._before_resource_write is not None:
+                            await self._before_resource_write()
                         enqueued_levels = await self._processor._vectorize_directory(
                             dir_uri,
                             context_type=self._context_type,
@@ -1646,6 +1665,8 @@ class SemanticTreeExecutor:
                     or slot.field_patch is None
                 ):
                     continue
+                if self._before_resource_write is not None:
+                    await self._before_resource_write()
                 enqueued = await self._processor._update_vector_fields(
                     record_id=slot.record_id,
                     uri=dir_uri,
