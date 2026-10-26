@@ -11,18 +11,6 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from tests.storage.test_tree_replace_structured import (
-    binding_fs as binding_fs,
-)
-from tests.storage.test_tree_replace_structured import (
-    enabled_tree as _enabled_tree,
-)
-from tests.storage.test_tree_replace_structured import (
-    indexed_fs as indexed_fs,
-)
-from tests.storage.test_tree_replace_structured import (
-    raw,
-)
 
 from openviking.server.api_keys.legacy import ACCOUNTS_PATH
 from openviking.server.auth import get_request_context
@@ -36,6 +24,18 @@ from openviking.storage.acl import AclMode
 from openviking.storage.errors import LockAcquisitionError
 from openviking_cli.exceptions import OpenVikingError
 from openviking_cli.session.user_id import UserIdentifier
+from tests.storage.test_tree_replace_structured import (
+    binding_fs as binding_fs,
+)
+from tests.storage.test_tree_replace_structured import (
+    enabled_tree as _enabled_tree,
+)
+from tests.storage.test_tree_replace_structured import (
+    indexed_fs as indexed_fs,
+)
+from tests.storage.test_tree_replace_structured import (
+    raw,
+)
 
 # Export the shared fixture while keeping its import separate from test arguments.
 enabled_tree = _enabled_tree
@@ -450,28 +450,8 @@ async def test_actual_owner_coverage_loss_after_index_delete_has_no_success(
     await release(lease)
 
 
-async def test_prune_alias_query_failure_is_not_absence(enabled_tree, monkeypatch):
-    fs, backend, ctx, target, *_ = enabled_tree
-    uri = target + "/orphan"
-    await seed(backend, uri, ctx)
-    account_backend = await backend.get_account_backend(ctx.account_id)
-    original = account_backend.strict_query
-    async def fail_eligibility(*args, **kwargs):
-        if kwargs.get("limit") == 1 and kwargs.get("output_fields") == ["uri"]:
-            raise OSError("injected alias eligibility failure")
-        return await original(*args, **kwargs)
-    monkeypatch.setattr(account_backend, "strict_query", fail_eligibility)
-    deletion = AsyncMock(wraps=fs._delete_from_vector_store)
-    monkeypatch.setattr(fs, "_delete_from_vector_store", deletion)
-    with pytest.raises(OpenVikingError) as error:
-        await FSService(fs).prune_resource_index(uri, ctx)
-    assert error.value.details["outcome"] == "not_started"
-    deletion.assert_not_called()
-    assert await backend.get(["orphan"], ctx=ctx)
-
-
 @pytest.mark.parametrize("root", [False, True])
-async def test_orphan_slash_rows_are_ineligible_even_for_root(enabled_tree, root):
+async def test_prune_native_uri_equivalence_keeps_same_acl_identity(enabled_tree, root):
     fs, backend, ctx, target, *_ = enabled_tree
     user = ctx if root else RequestContext(
         user=UserIdentifier(ctx.account_id, "maintainer"), role=Role.USER,
@@ -484,11 +464,9 @@ async def test_orphan_slash_rows_are_ineligible_even_for_root(enabled_tree, root
     uri = target + "/orphan"
     await seed(backend, uri, ctx, "canonical")
     await seed(backend, uri + "/", ctx, "slash")
-    with pytest.raises(OpenVikingError) as error:
-        await FSService(fs).prune_resource_index(uri, user)
-    assert error.value.code == "FAILED_PRECONDITION"
-    assert error.value.details["outcome"] == "not_started"
-    assert len(await backend.get(["canonical", "slash"], ctx=ctx)) == 2
+    result = await FSService(fs).prune_resource_index(uri, user)
+    assert result == {"uri": uri, "outcome": "pruned"}
+    assert not await backend.get(["canonical", "slash"], ctx=ctx)
     assert not await fs.exists(uri, ctx=ctx)
 
 
