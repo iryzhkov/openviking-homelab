@@ -13,6 +13,10 @@ from datetime import datetime, timezone
 from functools import wraps
 from typing import Any, AsyncIterator, Awaitable, Callable, Container, Dict, List, Mapping, Optional
 
+from openviking_cli.exceptions import InvalidArgumentError, ResourceExhaustedError
+from openviking_cli.utils import get_logger
+from openviking_cli.utils.config.vectordb_config import DEFAULT_INDEX_NAME, VectorDBBackendConfig
+
 from openviking.core.namespace import (
     resolve_uri,
     uri_parts,
@@ -49,9 +53,6 @@ from openviking.utils.tags import (
 )
 from openviking.utils.time_decay import parse_duration_ms
 from openviking.utils.time_utils import get_current_timestamp
-from openviking_cli.exceptions import InvalidArgumentError
-from openviking_cli.utils import get_logger
-from openviking_cli.utils.config.vectordb_config import DEFAULT_INDEX_NAME, VectorDBBackendConfig
 
 logger = get_logger(__name__)
 
@@ -1778,6 +1779,7 @@ class VikingVectorIndexBackend:
         output_fields: List[str],
         batch_size: int,
         what: str,
+        max_records: int | None = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Yield every record under ``scope`` with strict count/cursor guarantees.
 
@@ -1790,7 +1792,14 @@ class VikingVectorIndexBackend:
         """
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if max_records is not None and (type(max_records) is not int or max_records < 1):
+            raise ValueError("max_records must be positive")
         expected_count = await self._strict_transfer_count(ctx, scope)
+        if max_records is not None:
+            if type(expected_count) is not int or expected_count < 0:
+                raise RuntimeError("Bounded resource inventory count is invalid")
+            if expected_count > max_records:
+                raise ResourceExhaustedError("Resource reindex inventory limit exceeded")
         cursor: Optional[str] = None
         scanned_count = 0
         seen_cursors: set[str] = set()
@@ -1798,10 +1807,16 @@ class VikingVectorIndexBackend:
             page, next_cursor = await self._strict_transfer_page(
                 ctx,
                 scope,
-                limit=batch_size,
+                limit=(
+                    batch_size
+                    if max_records is None
+                    else min(batch_size, max_records + 1 - scanned_count)
+                ),
                 cursor=cursor,
                 output_fields=output_fields,
             )
+            if max_records is not None and scanned_count + len(page) > max_records:
+                raise ResourceExhaustedError("Resource reindex inventory limit exceeded")
             if not page and scanned_count < expected_count:
                 raise RuntimeError(
                     f"{what} ended after {scanned_count} of {expected_count} records"
@@ -1819,6 +1834,8 @@ class VikingVectorIndexBackend:
                 raise RuntimeError(
                     f"{what} cursor ended after {scanned_count} of {expected_count} records"
                 )
+            if max_records is not None and scanned_count >= expected_count:
+                raise RuntimeError("Bounded resource inventory has an unexpected continuation")
             if next_cursor in seen_cursors:
                 raise RuntimeError(f"{what} cursor repeated: {next_cursor}")
             seen_cursors.add(next_cursor)
@@ -2275,8 +2292,11 @@ class VikingVectorIndexBackend:
         output_fields: Optional[List[str]] = None,
         recursive: bool = True,
         include_direct_children: bool = False,
+        max_records: int | None = None,
     ) -> Dict[str, Dict[str, Any]]:
-        """Strictly load lightweight L0/L1/L2 metadata in a URI scope."""
+        """Strictly load metadata; an optional internal cap rejects before paging."""
+        if max_records is not None:
+            output_fields = [*(output_fields or []), "account_id"]
         projection = list(
             dict.fromkeys(
                 [
@@ -2311,7 +2331,15 @@ class VikingVectorIndexBackend:
                     output_fields=projection,
                     batch_size=batch_size,
                     what=what,
+                    **({"max_records": max_records} if max_records is not None else {}),
                 ):
+                    if max_records is not None and (
+                        not isinstance(record.get("id"), str)
+                        or not isinstance(record.get("uri"), str)
+                        or type(record.get("level")) is not int
+                        or record.get("account_id") != ctx.account_id
+                    ):
+                        raise RuntimeError("Bounded resource inventory binding is invalid")
                     record_id = str(record.get("id") or "")
                     record_uri = str(record.get("uri") or "")
                     try:
@@ -2342,6 +2370,10 @@ class VikingVectorIndexBackend:
                     )
                 return records
             except RuntimeError as exc:
+                if max_records is not None:
+                    raise RuntimeError(
+                        "Bounded resource inventory is incomplete or invalid"
+                    ) from None
                 last_error = exc
                 if attempt == len(retry_delays) or not any(
                     marker in str(exc)

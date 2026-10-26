@@ -9,6 +9,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from openviking_cli.exceptions import NotFoundError
+
 from openviking.concurrency import bounded_map
 from openviking.core.namespace import context_type_for_uri
 from openviking.server.error_mapping import is_not_found_error
@@ -27,7 +29,63 @@ from openviking.storage.resource_rnfv import (
     canonical_vector_records_by_level,
 )
 from openviking.utils.content_hash import content_md5
-from openviking_cli.exceptions import NotFoundError
+
+# Closed fresh-resource operation limits, not defaults for other RFV callers.
+RESOURCE_REINDEX_FORMAL_LIMIT = 128
+RESOURCE_REINDEX_INVENTORY_LIMIT = 384
+RESOURCE_REINDEX_ACTION_LIMIT = 384
+
+
+def validate_resource_reindex_uri(viking_fs, uri, ctx, *, target=None, is_dir=True):
+    """Reuse native resource grammar and exact storage identity; never normalize."""
+    from openviking.service.resource_maintenance import validate_resource_target
+
+    try:
+        validate_resource_target(uri)
+        if len(uri.encode("utf-8")) > 1024 or any(
+            len(part.encode("utf-8")) > 255 or not part.isprintable() or part == ".relations.json"
+            for part in uri.split("/")[3:]
+        ):
+            raise ValueError()
+        path = viking_fs._uri_to_path(uri, ctx=ctx)
+        if viking_fs._path_to_uri(path, ctx=ctx) != uri:
+            raise ValueError()
+        if target is not None and uri != target and not (is_dir and uri.startswith(target + "/")):
+            raise ValueError()
+    except Exception:
+        raise ValueError("Resource reindex requires canonical in-target URIs") from None
+
+
+def validate_resource_reindex_plan(viking_fs, snapshot, plan, ctx):
+    """Validate the entire original plan before capturing or dispatching any action."""
+    from openviking_cli.exceptions import ResourceExhaustedError
+
+    from openviking.storage.index_action import IndexAction
+    from openviking.storage.vector_ids import vector_record_id
+
+    target = snapshot.request.target_uri
+    is_dir = snapshot.formal.entries[""].is_dir
+    if len(plan.direct_index_actions) > RESOURCE_REINDEX_ACTION_LIMIT:
+        raise ResourceExhaustedError("Resource reindex action limit exceeded")
+    if plan.root_uri != target or plan.content_tree_actions:
+        raise ValueError("Resource reindex plan target changed")
+    for action in plan.direct_index_actions:
+        validate_resource_reindex_uri(viking_fs, action.uri, ctx, target=target, is_dir=is_dir)
+        if type(action.level) is not int or action.level not in (0, 1, 2):
+            raise ValueError("Resource reindex action level is invalid")
+        record = snapshot.vectors.records_by_id.get(action.record_id)
+        if record is not None:
+            if (
+                record.uri != action.uri
+                or record.level != action.level
+                or record.fields.get("account_id") != ctx.account_id
+            ):
+                raise ValueError("Resource reindex action record binding changed")
+        elif action.action not in (
+            IndexAction.UPSERT,
+            IndexAction.MERGE,
+        ) or action.record_id != vector_record_id(ctx.account_id, action.uri, action.level):
+            raise ValueError("Resource reindex action lacks an original record binding")
 
 
 @dataclass(frozen=True)
@@ -91,10 +149,15 @@ async def build_rfv_snapshot(
     source_read_concurrency: int = 8,
     root_is_dir: bool | None = None,
     formal_inventory: tuple[bool, list[Mapping[str, Any]], bool] | None = None,
+    resource_limits: bool = False,
 ) -> RFVSnapshot:
     """Read one complete F/V inventory and each selected embedding source once."""
+    if resource_limits:
+        validate_resource_reindex_uri(viking_fs, target_uri, ctx)
     root = target_uri.rstrip("/")
     projection = request_intent.required_vector_fields() | {"abstract"}
+    if resource_limits:
+        projection = projection | {"account_id"}
     if target_uri.rstrip("/").startswith(("viking://user/", "viking://agent/skills/")):
         projection = projection | {"name", "description", "tags"}
 
@@ -118,7 +181,7 @@ async def build_rfv_snapshot(
         if not recursive:
             entries = await viking_fs.ls(
                 root,
-                node_limit=None,
+                node_limit=RESOURCE_REINDEX_FORMAL_LIMIT if resource_limits else None,
                 show_all_hidden=True,
                 ctx=ctx,
             )
@@ -127,7 +190,7 @@ async def build_rfv_snapshot(
             root,
             output="original",
             show_all_hidden=True,
-            node_limit=None,
+            node_limit=RESOURCE_REINDEX_FORMAL_LIMIT if resource_limits else None,
             level_limit=None,
             ctx=ctx,
         )
@@ -142,6 +205,7 @@ async def build_rfv_snapshot(
             output_fields=sorted(projection),
             recursive=recursive,
             include_direct_children=include_direct_children,
+            **({"max_records": RESOURCE_REINDEX_INVENTORY_LIMIT} if resource_limits else {}),
         )
     )
     try:
@@ -154,6 +218,28 @@ async def build_rfv_snapshot(
                 task.cancel()
         await asyncio.gather(formal_task, vector_task, return_exceptions=True)
         raise
+    if resource_limits:
+        from openviking_cli.exceptions import ResourceExhaustedError
+
+        if len(raw_entries) + 1 > RESOURCE_REINDEX_FORMAL_LIMIT:
+            raise ResourceExhaustedError("Resource reindex formal inventory limit exceeded")
+        if len(inventory) > RESOURCE_REINDEX_INVENTORY_LIMIT:
+            raise ResourceExhaustedError("Resource reindex inventory limit exceeded")
+        for entry in raw_entries:
+            validate_resource_reindex_uri(
+                viking_fs, entry.get("uri"), ctx, target=root, is_dir=root_is_dir
+            )
+        for record_id, record in inventory.items():
+            validate_resource_reindex_uri(
+                viking_fs, record.get("uri"), ctx, target=root, is_dir=root_is_dir
+            )
+            if (
+                record_id != record.get("id")
+                or type(record.get("level")) is not int
+                or record["level"] not in (0, 1, 2)
+                or record.get("account_id") != ctx.account_id
+            ):
+                raise ValueError("Resource reindex inventory binding changed")
     complete = complete and not any(entry.get("access") == "denied" for entry in raw_entries)
     if not complete:
         raise ValueError("cannot build RFV snapshot from an incomplete formal tree")

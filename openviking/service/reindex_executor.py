@@ -10,6 +10,11 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Optional
 
+from openviking_cli.exceptions import InvalidArgumentError, NotFoundError, OpenVikingError
+from openviking_cli.utils import VikingURI, get_logger
+from openviking_cli.utils.config import get_openviking_config
+from openviking_cli.utils.config.embedding_config import SUMMARY_TEXT_SOURCES
+
 from openviking.config.vlm import VLMResolver
 from openviking.core.context import (
     Context,
@@ -47,10 +52,6 @@ from openviking.utils.embedding_utils import (
     get_resource_content_type,
 )
 from openviking.utils.ingest_options import IngestOptions
-from openviking_cli.exceptions import InvalidArgumentError, NotFoundError, OpenVikingError
-from openviking_cli.utils import VikingURI, get_logger
-from openviking_cli.utils.config import get_openviking_config
-from openviking_cli.utils.config.embedding_config import SUMMARY_TEXT_SOURCES
 
 logger = get_logger(__name__)
 
@@ -851,7 +852,10 @@ class ReindexExecutor:
         formal_entries: list[dict[str, Any]] | None = None,
     ) -> None:
         from openviking.storage.context_update_plan import build_rfv_context_update_plan
-        from openviking.storage.resource_rfv import build_rfv_snapshot
+        from openviking.storage.resource_rfv import (
+            build_rfv_snapshot,
+            validate_resource_reindex_plan,
+        )
         from openviking.storage.resource_rnfv import RequestIntent
         from openviking.utils.resource_processor import ResourceProcessor
 
@@ -876,6 +880,8 @@ class ReindexExecutor:
             request_intent=request,
             recursive=recursive,
             source_read_concurrency=self._effective_file_vectorization_concurrency(),
+            resource_limits=(uri == "viking://resources" or uri.startswith("viking://resources/"))
+            and mode == "vectors_only",
             root_is_dir=run.root_is_dir if root_is_dir is None else root_is_dir,
             formal_inventory=(
                 (True if root_is_dir is None else root_is_dir, formal_entries, True)
@@ -924,6 +930,8 @@ class ReindexExecutor:
             raise ResourceEmbeddingConflict(
                 "Resource vectors-only reindex cannot request semantic or parent refresh"
             )
+        if _resource_uri(uri) and mode == "vectors_only":
+            validate_resource_reindex_plan(service.viking_fs, snapshot, plan, run.ctx)
         run.counters.scanned_records += len(snapshot.formal.entries)
         if plan.direct_index_actions:
             from openviking.storage.queuefs.resource_embedding_fence import (
