@@ -30,6 +30,10 @@ def _tree_paths_from_handoff(lock_paths: Iterable[str]) -> list[str]:
     return tree_paths
 
 
+class ResourceInputConflict(ValueError):
+    """Resource work cannot prove that its original inputs are still valid."""
+
+
 @dataclass
 class SemanticLockScope:
     """Resolved lock scope for one semantic message."""
@@ -44,6 +48,7 @@ class SemanticLockScope:
         *,
         caller_lock: Optional[Dict[str, Any]] = None,
         fallback_path_factory: Optional[Callable[[], str]] = None,
+        refuse_stale: bool = False,
     ) -> "SemanticLockScope":
         """Resolve a live lock, reacquiring its original coverage when stale."""
         if lock_handoff and caller_lock is not None:
@@ -63,6 +68,10 @@ class SemanticLockScope:
                     "logical-path provider handoff requires covered_paths" not in error_message
                 ):
                     raise
+                if refuse_stale:
+                    raise ResourceInputConflict(
+                        "Resource handoff ownership was lost; original inputs cannot be revalidated"
+                    ) from error
                 covered_paths = lock_handoff.get("covered_paths") or []
                 if not covered_paths:
                     tree_paths = _tree_paths_from_handoff(lock_handoff["lock_paths"])
