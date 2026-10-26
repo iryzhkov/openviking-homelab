@@ -148,6 +148,7 @@ class FileStore(AccountStore):
             else 30.0
         )
         self._watch_task: Optional[asyncio.Task] = None
+        self._identity_loop: asyncio.AbstractEventLoop | None = None
         self._accounts: Dict[str, AccountInfo] = {}
         # Prefix index: key_prefix -> list[UserKeyEntry]
         self._prefix_index: Dict[str, list[UserKeyEntry]] = {}
@@ -200,6 +201,10 @@ class FileStore(AccountStore):
 
     async def load(self) -> None:
         """Load keys into memory (writable startup path; migrates plaintext; see reload())."""
+        loop = asyncio.get_running_loop()
+        if self._identity_loop is not None and self._identity_loop is not loop:
+            raise FailedPreconditionError("FileStore must be loaded on its original event loop")
+        self._identity_loop = loop
         async with self._mutation_lock:
             accounts_data = await self._initialize_account_registry()
 
@@ -1537,26 +1542,46 @@ class FileStore(AccountStore):
                 await self._refresh_account_users_from_store_unlocked(account_id)
 
     async def get_account_identity(self, account_id: str) -> AccountIdentity | None:
-        # Bypass both watcher state and backend cache, even for ROOT callers.
+        # Queue handlers have their own thread loops. Read only a local snapshot
+        # there, serialized with registry writers by the existing native lease.
+        # Do not touch management caches or their loop-bound asyncio mutexes.
+        if (
+            self._identity_loop is not None
+            and self._identity_loop is not asyncio.get_running_loop()
+        ):
+            lease = await self._async_agfs.pathlock_acquire_exact(ACCOUNTS_PATH, timeout_secs=10.0)
+            try:
+                data = await self._read_json(ACCOUNTS_PATH, bypass_cache=True)
+                return self._account_identity_from_snapshot(data, account_id)
+            finally:
+                await self._async_agfs.pathlock_release(lease)
+        # Preserve owner-loop cache invalidation and mutation serialization.
         async with self._mutation_lock:
             data = await self._read_json(ACCOUNTS_PATH, bypass_cache=True)
             if data is None:
                 self._accounts = {}
                 self._prefix_index = {}
                 self._user_group_ids = {}
-                return None
-            accounts = data.get("accounts")
-            if not isinstance(accounts, dict):
-                raise FailedPreconditionError("Invalid account registry")
-            if account_id not in accounts:
-                return None
-            record = accounts[account_id]
-            if not isinstance(record, dict):
-                raise FailedPreconditionError("Invalid account record")
-            return AccountIdentity(
-                creation_identity=f"legacy:{self._creation_id(record)}",
-                deleting=record.get("deletion") is not None,
-            )
+            return self._account_identity_from_snapshot(data, account_id)
+
+    @classmethod
+    def _account_identity_from_snapshot(
+        cls, data: dict | None, account_id: str
+    ) -> AccountIdentity | None:
+        if data is None:
+            return None
+        accounts = data.get("accounts")
+        if not isinstance(accounts, dict):
+            raise FailedPreconditionError("Invalid account registry")
+        if account_id not in accounts:
+            return None
+        record = accounts[account_id]
+        if not isinstance(record, dict):
+            raise FailedPreconditionError("Invalid account record")
+        return AccountIdentity(
+            creation_identity=f"legacy:{cls._creation_id(record)}",
+            deleting=record.get("deletion") is not None,
+        )
 
     async def get_account(self, account_id: str) -> AccountSummary | None:
         await self._refresh_accounts_for_management_read()
