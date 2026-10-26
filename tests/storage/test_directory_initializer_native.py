@@ -2,7 +2,7 @@
 import pytest
 
 from openviking.core.directories import DirectoryInitializer
-from openviking.core.namespace import canonical_user_root
+from openviking.core.namespace import canonical_user_root, is_session_uri
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.errors import LockAcquisitionError
 from openviking_cli.session.user_id import UserIdentifier
@@ -30,8 +30,9 @@ async def test_initializer_cold_workspace_for_thirty_accounts_and_repeat(binding
         roots, children = initializer._account_directory_targets(ctx)
         user_root, user_children = initializer._user_directory_targets(ctx)
         expected = {target.uri for target in (*roots, *children, user_root, *user_children)}
-        assert {msg.context_data["uri"] for msg in db.embedding_messages} == expected
-        assert len(db.embedding_messages) == 2 * len(expected)
+        vectorized = {uri for uri in expected if not is_session_uri(uri)}
+        assert {msg.context_data["uri"] for msg in db.embedding_messages} == vectorized
+        assert len(db.embedding_messages) == 2 * len(vectorized)
         assert len(db.get_calls) == 1
         for uri in expected:
             assert (await fs.read_file(f"{uri}/.abstract.md", ctx=ctx))
@@ -39,7 +40,7 @@ async def test_initializer_cold_workspace_for_thirty_accounts_and_repeat(binding
         # Existing parents and all preset bytes remain idempotent.
         assert await initializer.initialize_account_workspace(ctx) == (0, 0)
         assert len(db.get_calls) == 1
-        assert len(db.embedding_messages) == 2 * len(expected)
+        assert len(db.embedding_messages) == 2 * len(vectorized)
     assert not failures, f"initializer failed fresh accounts: {failures!r}"
 
 
