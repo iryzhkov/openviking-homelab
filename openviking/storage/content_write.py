@@ -105,6 +105,7 @@ from openviking.utils.tags import normalize_search_tags
 from openviking_cli.exceptions import (
     ConflictError,
     DeadlineExceededError,
+    FailedPreconditionError,
     InvalidArgumentError,
     NotFoundError,
     OpenVikingError,
@@ -688,6 +689,19 @@ class ContentWriteCoordinator:
         """
         normalized_root = self._validate_uri_path(root_uri, field_name="root_uri")
         processing_mode = normalize_processing_mode(processing_mode)
+        # Resource batches have no original-admission refresh binding. Refuse
+        # even the default path before locks, Tasks, bytes or ACL publication.
+        # Deferred raw-file writes and FILE_ONLY namespaces emit no refresh.
+        if (
+            self._viking_fs._is_shared_resource_uri(normalized_root)
+            and namespace_policy_for_uri(normalized_root).processing_mode
+            is not NamespaceProcessingMode.FILE_ONLY
+            and not defer_processing
+        ):
+            raise FailedPreconditionError(
+                "Resource batch refresh is unsupported; use defer_processing=True "
+                "for raw-file writes or an admitted single write"
+            )
         qualified_resource = self._viking_fs._is_shared_resource_uri(normalized_root) and any(
             operation.get("expected_absent") or operation.get("expected_sha256") is not None
             for operation in operations
@@ -2206,7 +2220,14 @@ class ContentWriteCoordinator:
         root_operation: str = "content_write",
         root_task_factory: Callable[[], Awaitable[Any]] | None = None,
     ) -> Dict[str, Any]:
-        """Re-embed a manually edited L0/L1 sidecar body without LLM regeneration."""
+        """Re-embed a manually edited L0/L1 sidecar body without LLM regeneration.
+
+        Resource sidecars lack an original-admission refresh binding, so manual
+        edits are unsupported. Internal admitted semantic writers use the lower
+        filesystem helpers and do not enter this public producer.
+        """
+        if self._viking_fs._is_shared_resource_uri(uri):
+            raise FailedPreconditionError("Manual resource semantic sidecar edits are unsupported")
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
         lock_guard = PathLockGuard(self._viking_fs._async_agfs)
         try:
