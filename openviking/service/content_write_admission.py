@@ -14,8 +14,15 @@ from openviking.storage.queuefs.resource_embedding_fence import (
 
 def content_write_admission(msg):
     """Read carried admission, never capture identity from a queued request."""
-    if not _resource_uri(msg.resource_id) or msg.refresh.get("kind") != "plan":
+    if not _resource_uri(msg.resource_id):
         return None
+    kind = str(msg.refresh.get("kind") or "none")
+    if kind == "none":
+        return None
+    if kind != "plan":
+        # Batch and other unbound refresh shapes would write freshness or
+        # sidecars before any original-identity check. Refuse at admission.
+        raise ResourceEmbeddingConflict("Unbound resource content refresh is unsupported")
     proof = msg.refresh.get("resource_admission")
     if not isinstance(proof, dict):
         raise ResourceEmbeddingConflict("Resource content write lacks original admission")

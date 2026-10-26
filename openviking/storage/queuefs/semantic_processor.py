@@ -403,9 +403,11 @@ class SemanticProcessor(DequeueHandlerBase):
             return
         parent_ctx = self._ctx_from_semantic_msg(msg)
         semantic_config = get_openviking_config().semantic
-        try:
-            decision = await plan_abstract_overview_refresh(
-                viking_fs=get_viking_fs(),
+        viking_fs = get_viking_fs()
+
+        async def plan(lease_ref=None):
+            return await plan_abstract_overview_refresh(
+                viking_fs=viking_fs,
                 dir_uri=parent_uri,
                 changed_entries=1,
                 ctx=parent_ctx,
@@ -417,7 +419,16 @@ class SemanticProcessor(DequeueHandlerBase):
                 overview_sample_limit=getattr(semantic_config, "overview_sample_limit", 32),
                 refresh_ratio=getattr(semantic_config, "freshness_refresh_ratio", 0.10),
                 lock_timeout_secs=1.0,
+                lease_ref=lease_ref,
             )
+
+        try:
+            if msg.context_type == "resource":
+                decision = await self._resource_parent_freshness(msg, parent_ctx, plan)
+                if decision is None:
+                    return
+            else:
+                decision = await plan()
         except LockAcquisitionError:
             logger.info(
                 "Skipping best-effort parent freshness update because sidecars are busy: %s",
@@ -470,6 +481,44 @@ class SemanticProcessor(DequeueHandlerBase):
             with detach_task_context():
                 await semantic_queue.enqueue(parent_msg)
         logger.info("Enqueued parent semantic refresh: %s", parent_uri)
+
+    async def _resource_parent_freshness(self, msg, parent_ctx, plan):
+        """Run resource parent freshness under final coverage of the original lifetime.
+
+        The child's own coverage is already closed. Before touching any parent
+        sidecar, acquire resources-root coverage and recheck the message's
+        original creation identity after that acquisition; the freshness writes
+        reuse this lease and settle before it is released. Returns None when the
+        original lifetime is gone, so nothing is written or queued.
+        """
+        from openviking.service.account_identity import AccountIdentity
+
+        identity = msg.resource_creation_identity
+        if not isinstance(identity, str) or not identity:
+            logger.warning("Refusing resource parent freshness without original identity")
+            return None
+        viking_fs = get_viking_fs()
+
+        async def run():
+            try:
+                lease = await viking_fs._acquire_resource_coverage(
+                    parent_ctx, AccountIdentity(identity, False), timeout_secs=1.0
+                )
+            except LockAcquisitionError:
+                raise
+            except Exception as error:
+                logger.warning(
+                    "Refusing resource parent freshness for a changed account lifetime: %s",
+                    type(error).__name__,
+                )
+                return None
+            guard = PathLockGuard(viking_fs._async_agfs, lease)
+            try:
+                return await plan(lease_ref=lease)
+            finally:
+                await guard.close()
+
+        return await run_to_completion(run)
 
     def _message_work(
         self, msg: SemanticMsg, lock: Optional[Dict[str, Any]] = None

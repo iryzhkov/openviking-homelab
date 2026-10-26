@@ -16,8 +16,22 @@ from openviking.storage.queuefs.semantic_ops.freshness_policy import (
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 
 
+def _direct_resource_freshness(monkeypatch):
+    """Unit seam: run freshness directly instead of under native coverage.
+
+    Original-lifetime coverage for resource parents is exercised end to end in
+    tests/server/test_queued_admission_repair.py.
+    """
+
+    async def direct(self, msg, parent_ctx, plan):
+        return await plan()
+
+    monkeypatch.setattr(SemanticProcessor, "_resource_parent_freshness", direct)
+
+
 @pytest.mark.asyncio
 async def test_unchanged_l0_does_not_mark_or_enqueue_parent(monkeypatch):
+    _direct_resource_freshness(monkeypatch)
     plan = AsyncMock(
         return_value=FreshnessDecision(FreshnessAction.NOOP, pending_after=3, total_entries=161)
     )
@@ -130,6 +144,7 @@ async def test_parent_refresh_stops_at_nonsemantic_namespace_root(monkeypatch, u
 async def test_parent_refresh_preserves_semantic_roots(
     monkeypatch, uri, context_type, expected_parent
 ):
+    _direct_resource_freshness(monkeypatch)
     plan = AsyncMock(side_effect=LockAcquisitionError("parent sidecars are busy"))
     monkeypatch.setattr(
         "openviking.storage.queuefs.semantic_processor.plan_abstract_overview_refresh",
