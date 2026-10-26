@@ -11,9 +11,10 @@ from openviking.server.identity import RequestContext
 from openviking.service.task_tracker import get_task_tracker
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.service.task_work_index import get_enqueued_work_ids, get_task_context
+from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.queuefs.process_result import ProcessResult
 from openviking.storage.queuefs.semantic_executor import SemanticTreeStats
-from openviking.storage.queuefs.semantic_lock import SemanticLockScope
+from openviking.storage.queuefs.semantic_lock import ResourceInputConflict, SemanticLockScope
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import (
@@ -22,6 +23,7 @@ from openviking.telemetry import (
     resolve_telemetry,
     unregister_telemetry,
 )
+from openviking.utils.content_hash import content_md5
 
 if TYPE_CHECKING:
     from openviking.storage.queuefs.semantic_processor import SemanticProcessor
@@ -118,6 +120,156 @@ class SemanticMessageWork:
         if self.scope is not None and not self._lock_closed:
             await self.scope.close()
             self._lock_closed = True
+
+
+class ResourceSemanticMessageWork(SemanticMessageWork):
+    """Fence resource inputs with continuously owned tree coverage."""
+
+    async def acquire_lock(self, ctx: RequestContext) -> bool:
+        async def acquire() -> None:
+            fs = get_viking_fs()
+            msg = self.msg
+            admitted = await fs._capture_resource_identity(ctx)
+            self.scope = await SemanticLockScope.resolve(
+                msg.lock_handoff, caller_lock=self.caller_lock, refuse_stale=True
+            )
+            if self.scope.lock is None:
+                # Resource-root coverage includes every recursive effect.
+                lease = await fs._async_agfs.pathlock_acquire_batch(
+                    [{"path": fs._uri_to_path("viking://resources", ctx=ctx), "kind": "tree"}]
+                )
+                self.scope = SemanticLockScope(lease, _owned=True)
+            required = [
+                msg.uri,
+                msg.target_uri or msg.uri,
+                *msg.file_md5s,
+                *msg.file_abstracts,
+                *msg.file_vector_actions,
+                *msg.file_ingest_options,
+            ]
+            # The opaque lease descriptor intentionally omits coverage. Export
+            # it from the manager using the current ownership capability.
+            owner = self.caller_lock if self.caller_lock is not None else self.scope.lock
+            current = await fs._async_agfs.pathlock_to_handoff(owner)
+            covered = current.get("covered_paths") or []
+            for uri in required:
+                path = fs._uri_to_path(uri, ctx=ctx).rstrip("/")
+                if not any(
+                    item.get("kind") == "tree"
+                    and (
+                        path == item.get("path", "").rstrip("/")
+                        or path.startswith(item.get("path", "").rstrip("/") + "/")
+                    )
+                    for item in covered
+                ):
+                    raise ResourceInputConflict("Resource semantic effects lack tree coverage")
+            if msg.lock_handoff is None:
+                # Plans, staging copies and parse artifacts contain historical
+                # material without a complete compare condition in this schema.
+                if (
+                    msg.plan is not None
+                    or msg.artifact_ref
+                    or msg.artifact_files
+                    or msg.source
+                    or msg.copy_source_uri
+                    or (msg.target_uri and msg.target_uri != msg.uri)
+                ):
+                    raise ResourceInputConflict("Resource cached inputs require a live handoff")
+                cached_files = (
+                    set(msg.file_abstracts)
+                    | set(msg.file_vector_actions)
+                    | set(msg.file_ingest_options)
+                )
+                if msg.generation_trigger == "content_write":
+                    cached_files.update(
+                        uri
+                        for kind in ("added", "modified")
+                        for uri in (msg.changes or {}).get(kind, [])
+                    )
+                if not cached_files.issubset(msg.file_md5s):
+                    raise ResourceInputConflict(
+                        "Resource cached inputs lack byte compare conditions"
+                    )
+                for uri, expected in msg.file_md5s.items():
+                    raw = await fs.read_file_bytes(uri, ctx=ctx)
+                    if not expected or content_md5(raw) != expected:
+                        raise ResourceInputConflict(
+                            "Resource input bytes changed before processing"
+                        )
+            if not msg.skip_vectorization and get_task_context() is None:
+                raise ResourceInputConflict("Resource vector work requires tracked completion")
+            from openviking.service.account_identity import recheck_account_identity
+            from openviking.storage.queuefs.resource_embedding_fence import (
+                ResourceEmbeddingProducer,
+            )
+
+            await recheck_account_identity(fs._account_identity_manager, ctx.account_id, admitted)
+            self._embedding_producer = ResourceEmbeddingProducer(ctx, admitted, owner)
+
+        await run_to_completion(acquire)
+        from openviking.storage.queuefs.resource_embedding_fence import (
+            bind_resource_embedding_producer,
+        )
+
+        self._producer_binding = bind_resource_embedding_producer(self._embedding_producer)
+        self._producer_binding.__enter__()
+        return True
+
+    async def validate_ownership(self) -> None:
+        assert self.scope is not None and self.scope.lock is not None
+        owner = self.caller_lock if self.caller_lock is not None else self.scope.lock
+        try:
+            status = await get_viking_fs()._async_agfs.pathlock_refresh(owner)
+        except (LockAcquisitionError, RuntimeError, ValueError) as error:
+            raise ResourceInputConflict("Resource lease ownership was lost") from error
+        if status != "refreshed":
+            raise ResourceInputConflict("Resource lease ownership was lost")
+
+    async def run_write(self, factory: Callable[[], Awaitable[_Result]]) -> _Result:
+        async def write() -> _Result:
+            await self.validate_ownership()
+            return await factory()
+
+        return await run_to_completion(write)
+
+    async def finish_processing(self, succeeded: bool) -> None:
+        # Resource writes enqueue vectors even without a producer handoff.
+        # Drain started work on failure/cancellation as well as success. The
+        # embedding consumer still needs its own final fence after ownership
+        # loss or process restart; a wait here cannot qualify that boundary.
+        if not self.msg.skip_vectorization:
+            await run_to_completion(self._wait_for_embedding_work)
+        if succeeded:
+            assert self.scope is not None
+            await self.scope.close()
+            self._lock_closed = True
+
+    async def close(self) -> None:
+        try:
+            await super().close()
+        except (LockAcquisitionError, RuntimeError, ValueError) as error:
+            # Release was attempted with our original capability. A revoked
+            # capability cannot release a new owner; never reacquire or remove
+            # directories to clean up that owner's work.
+            if "owned lease capability does not match ref" not in str(error):
+                raise
+            assert self.scope is not None
+            self.scope.lock = None
+            self.scope._owned = False
+            self._lock_closed = True
+        finally:
+            binding = getattr(self, "_producer_binding", None)
+            if binding is not None:
+                self._producer_binding = None
+                binding.__exit__(None, None, None)
+
+    def failure_result(self, stats: SemanticTreeStats | None) -> ProcessResult | None:
+        if stats is not None and stats.failures:
+            self.processor._merge_request_stats(
+                self.msg.telemetry_id, error_count=len(stats.failures)
+            )
+            return ProcessResult.failed("\n".join(stats.failures), errors=tuple(stats.failures))
+        return None
 
 
 class SkillSemanticMessageWork(SemanticMessageWork):

@@ -59,7 +59,11 @@ from openviking.storage.queuefs.semantic_lock import SemanticLockScope
 from openviking.storage.queuefs.semantic_msg import SemanticMsg, build_semantic_coalesce_key
 from openviking.storage.queuefs.semantic_ops.freshness_policy import FreshnessAction
 from openviking.storage.queuefs.semantic_queue import is_semantic_msg_stale
-from openviking.storage.queuefs.semantic_work import SemanticMessageWork, SkillSemanticMessageWork
+from openviking.storage.queuefs.semantic_work import (
+    ResourceSemanticMessageWork,
+    SemanticMessageWork,
+    SkillSemanticMessageWork,
+)
 from openviking.storage.viking_fs import LS_ALL_NODES, SyncDiff, get_viking_fs
 from openviking.telemetry import (
     bind_telemetry,
@@ -93,6 +97,8 @@ def _is_permanent_storage_error(error: BaseException) -> bool:
 
 def _executor_lock(msg: SemanticMsg, lock: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Reuse content-write ownership only when it covers semantic sidecars."""
+    if msg.context_type == "resource":
+        return lock
     if msg.generation_trigger != "content_write" or msg.lock_handoff is None:
         return lock
     covered_paths = msg.lock_handoff.get("covered_paths")
@@ -460,6 +466,8 @@ class SemanticProcessor(DequeueHandlerBase):
     def _message_work(
         self, msg: SemanticMsg, lock: Optional[Dict[str, Any]] = None
     ) -> SemanticMessageWork:
+        if msg.context_type == "resource":
+            return ResourceSemanticMessageWork(self, msg, lock)
         work_type = SkillSemanticMessageWork if msg.context_type == "skill" else SemanticMessageWork
         return work_type(self, msg, lock)
 
@@ -481,11 +489,15 @@ class SemanticProcessor(DequeueHandlerBase):
             logger.error("Invalid semantic message: %s", exc, exc_info=True)
             return ProcessResult.failed(str(exc))
 
-        if msg.context_type != "skill" or get_task_context() is not None:
+        if (
+            VikingURI(msg.uri).parent is None
+            or msg.context_type not in {"skill", "resource"}
+            or get_task_context() is not None
+        ):
             return await self._process_message(msg, lock)
 
-        # Parent refreshes and recovered taskless Skill messages need their own
-        # child-work collector so package ownership lasts through vector writes.
+        # Parent refreshes and recovered taskless Skill/Resource messages need
+        # a child-work collector so ownership lasts through vector writes.
         result: Optional[ProcessResult] = None
 
         async def process() -> Dict[str, Any]:
@@ -562,6 +574,8 @@ class SemanticProcessor(DequeueHandlerBase):
                     )
                     await work.skip()
                     await self._cleanup_local_artifact(msg)
+                    if msg.context_type == "resource":
+                        return ProcessResult.failed("Resource semantic work was superseded before execution")
                     return ProcessResult.success()
             # Circuit breaker: if API is known-broken, re-enqueue and wait
             try:
@@ -598,6 +612,8 @@ class SemanticProcessor(DequeueHandlerBase):
                     if not await get_viking_fs().exists(msg.uri, ctx=current_ctx):
                         logger.info("Skipping semantic message for missing root: uri=%s", msg.uri)
                         await work.skip()
+                        if msg.context_type == "resource":
+                            return ProcessResult.failed("Resource semantic input no longer exists")
                         return ProcessResult.success()
 
                     if self._vlm_resolver is None:
@@ -609,6 +625,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     semantic_lock = work.scope
                     assert semantic_lock is not None
                     dag_stats = None
+                    resource_parent_refreshes: list[tuple[str, bool]] = []
                     processing_succeeded = False
                     try:
                         if msg.plan is not None:
@@ -627,6 +644,11 @@ class SemanticProcessor(DequeueHandlerBase):
                                     lock=semantic_lock.lock,
                                     source=msg.plan.source_metadata,
                                     semantic_plan=msg.plan,
+                                    before_resource_write=(
+                                        work.validate_ownership
+                                        if isinstance(work, ResourceSemanticMessageWork)
+                                        else None
+                                    ),
                                     telemetry_id=msg.telemetry_id,
                                     generation_trigger=msg.generation_trigger,
                                 )
@@ -634,6 +656,10 @@ class SemanticProcessor(DequeueHandlerBase):
                                 self._cache_tree_stats(
                                     msg.telemetry_id, run_uri, executor.get_stats()
                                 )
+                                if msg.context_type == "resource":
+                                    if dag_stats is None:
+                                        dag_stats = SemanticTreeStats()
+                                    dag_stats.failures.extend(executor.get_stats().failures)
                                 if not executor.stale:
                                     write_result = getattr(
                                         executor,
@@ -642,11 +668,16 @@ class SemanticProcessor(DequeueHandlerBase):
                                             wrote=True, abstract_body_changed=True
                                         ),
                                     )
-                                    await self._enqueue_parent_refresh(
-                                        msg,
-                                        run_uri,
-                                        l0_body_changed=write_result.abstract_body_changed,
-                                    )
+                                    if msg.context_type == "resource":
+                                        resource_parent_refreshes.append(
+                                            (run_uri, write_result.abstract_body_changed)
+                                        )
+                                    else:
+                                        await self._enqueue_parent_refresh(
+                                            msg,
+                                            run_uri,
+                                            l0_body_changed=write_result.abstract_body_changed,
+                                        )
                             from collections import Counter
 
                             entries = msg.plan.tree.entries
@@ -747,6 +778,11 @@ class SemanticProcessor(DequeueHandlerBase):
                                 aggregate_directory=msg.aggregate_directory,
                                 copy_source_uri=msg.copy_source_uri,
                                 file_md5s=msg.file_md5s,
+                                before_resource_write=(
+                                        work.validate_ownership
+                                        if isinstance(work, ResourceSemanticMessageWork)
+                                        else None
+                                    ),
                                 artifact_files=msg.artifact_files,
                                 file_abstracts=msg.file_abstracts,
                                 file_vector_actions=msg.file_vector_actions,
@@ -768,17 +804,29 @@ class SemanticProcessor(DequeueHandlerBase):
                                         wrote=True, abstract_body_changed=True
                                     ),
                                 )
-                                await self._enqueue_parent_refresh(
-                                    msg,
-                                    target_uri or msg.uri,
-                                    l0_body_changed=write_result.abstract_body_changed,
-                                )
+                                if msg.context_type == "resource":
+                                    resource_parent_refreshes.append(
+                                        (target_uri or msg.uri, write_result.abstract_body_changed)
+                                    )
+                                else:
+                                    await self._enqueue_parent_refresh(
+                                        msg,
+                                        target_uri or msg.uri,
+                                        l0_body_changed=write_result.abstract_body_changed,
+                                    )
                         processing_succeeded = True
                     finally:
                         await work.finish_processing(processing_succeeded)
                     failure = work.failure_result(dag_stats)
                     if failure is not None:
                         return failure
+                    # Parent freshness rereads and writes under its own exact
+                    # sidecar lease. Run it after releasing resource coverage,
+                    # avoiding nested acquisition inside the resource Tree.
+                    for parent_source, changed in resource_parent_refreshes:
+                        await self._enqueue_parent_refresh(
+                            msg, parent_source, l0_body_changed=changed
+                        )
                     self._merge_request_stats(msg.telemetry_id, processed=1)
                     logger.info(f"Completed semantic generation for: {msg.uri}")
                     breaker.record_success()
