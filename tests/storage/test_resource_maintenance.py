@@ -388,8 +388,11 @@ async def test_partial_failure_and_cancellation_release_coverage_truthfully(
             await FSService(fs).remove_resource_only(uri, ctx)
         assert error.value.details == {"uri": uri, "outcome": "unknown"}
         assert "secret" not in str(error.value)
-    assert await raw(fs, uri, ctx) == b"old one"
-    assert bool(await backend.get(["orphan"], ctx=ctx)) == (failure == "index")
+    if failure == "index":
+        assert not await fs.exists(uri, ctx=ctx)
+    else:
+        assert await raw(fs, uri, ctx) == b"old one"
+    assert await backend.get(["orphan"], ctx=ctx)
     # Both inner owner extension and outer coverage must have been released.
     lease = await agfs.pathlock_acquire_tree(fs._uri_to_path("viking://resources", ctx=ctx))
     await agfs.pathlock_release(lease)
@@ -456,7 +459,7 @@ async def test_actual_owner_coverage_loss_after_index_delete_has_no_success(
     with pytest.raises(OpenVikingError) as error:
         await FSService(fs).remove_resource_only(uri, ctx)
     assert error.value.details == {"uri": uri, "outcome": "unknown"}
-    assert await raw(fs, uri, ctx) == b"old one"
+    assert not await fs.exists(uri, ctx=ctx)
     assert not await backend.get(["orphan"], ctx=ctx)
     lease = await acquire(
         [{"path": fs._uri_to_path("viking://resources", ctx=ctx), "kind": "tree"}]
@@ -467,13 +470,20 @@ async def test_actual_owner_coverage_loss_after_index_delete_has_no_success(
 @pytest.mark.parametrize("root", [False, True])
 async def test_prune_native_uri_equivalence_keeps_same_acl_identity(enabled_tree, root):
     fs, backend, ctx, target, *_ = enabled_tree
-    user = ctx if root else RequestContext(
-        user=UserIdentifier(ctx.account_id, "maintainer"), role=Role.USER,
+    user = (
+        ctx
+        if root
+        else RequestContext(
+            user=UserIdentifier(ctx.account_id, "maintainer"),
+            role=Role.USER,
+        )
     )
     owner = {"principal": "user:" + ctx.user.user_id, "level": "manage"}
     await fs.set_acl(
-        target, [owner, {"principal": "user:maintainer", "level": "manage"}],
-        ctx=ctx, acl_mode=AclMode.RESTRICTED,
+        target,
+        [owner, {"principal": "user:maintainer", "level": "manage"}],
+        ctx=ctx,
+        acl_mode=AclMode.RESTRICTED,
     )
     uri = target + "/orphan"
     await seed(backend, uri, ctx, "canonical")
@@ -495,6 +505,7 @@ async def test_caller_cancellation_after_index_delete_releases_both_leases(
     delete = fs._delete_from_vector_store
 
     async def pause_after_index(*args, **kwargs):
+        assert not await fs.exists(uri, ctx=ctx)
         await delete(*args, **kwargs)
         reached.set()
         await wait.wait()
@@ -517,11 +528,274 @@ async def test_caller_cancellation_after_index_delete_releases_both_leases(
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
     assert not await backend.get(["orphan"], ctx=ctx)
-    if operation == "remove":
-        assert await raw(fs, uri, ctx) == b"old one"
-    else:
-        assert not await fs.exists(uri, ctx=ctx)
+    assert not await fs.exists(uri, ctx=ctx)
     lease = await fs._async_agfs.pathlock_acquire_tree(
         fs._uri_to_path("viking://resources", ctx=ctx)
     )
     await fs._async_agfs.pathlock_release(lease)
+
+
+@pytest.mark.parametrize("directory", [False, True])
+@pytest.mark.parametrize(
+    "failure", ["refusal", "cancel", "partial", "response_loss", "index", "success"]
+)
+async def test_restricted_remove_keeps_policy_until_native_absence(
+    enabled_tree, monkeypatch, directory, failure
+):
+    fs, backend, ctx, target, *_ = enabled_tree
+    uri = target + "/branch" if directory else target + "/one.md"
+    member = uri + "/two.md" if directory else uri
+    outsider = RequestContext(user=UserIdentifier(ctx.account_id, "outsider"), role=Role.USER)
+    maintainer = RequestContext(user=UserIdentifier(ctx.account_id, "maintainer"), role=Role.USER)
+    grants = [
+        {"principal": "user:" + ctx.user.user_id, "level": "manage"},
+        {"principal": "user:maintainer", "level": "manage"},
+    ]
+    await seed(backend, uri, ctx, "remove-policy")
+    await fs.set_acl(target, grants, ctx=ctx, acl_mode=AclMode.NONE)
+    assert await fs.read_file_bytes(member, ctx=outsider)
+    await fs.set_acl(uri, grants, ctx=ctx, acl_mode=AclMode.RESTRICTED)
+    before = await fs.acl_manager.resolve(uri, ctx)
+    expected_uris = [uri]
+    if directory:
+        expected_uris += await fs._collect_uris(fs._uri_to_path(uri, ctx=ctx), True, ctx=ctx)
+    await seed(backend, target + "/sibling", ctx, "sibling-remove")
+    foreign = replace(ctx, user=UserIdentifier("other-account", "owner"))
+    await seed(backend, uri, foreign, "foreign-remove")
+    native, delete = fs._async_agfs.rm, fs._delete_from_vector_store
+    path = fs._uri_to_path(uri, ctx=ctx)
+    phases = []
+
+    async def denied():
+        with pytest.raises(OpenVikingError) as error:
+            await fs.read_file_bytes(member, ctx=outsider)
+        assert error.value.code == "PERMISSION_DENIED"
+
+    async def remove(p, *args, **kwargs):
+        if p != path:
+            return await native(p, *args, **kwargs)
+        phases.append("native")
+        await denied()
+        assert await fs.acl_manager.resolve(uri, ctx) == before
+        phases.append("policy_checked")
+        if failure == "refusal":
+            raise OSError("native refusal")
+        if failure == "cancel":
+            raise asyncio.CancelledError()
+        if failure == "partial":
+            if directory:
+                await native(
+                    fs._uri_to_path(uri + "/deeper/three.md", ctx=ctx),
+                    fs_ctx=kwargs["fs_ctx"],
+                    auto_pathlock=False,
+                )
+            await denied()
+            raise OSError("partial removal")
+        result = await native(p, *args, **kwargs)
+        assert not await fs.exists(uri, ctx=ctx)
+        await denied()
+        if failure == "response_loss":
+            raise OSError("native response lost")
+        return result
+
+    async def cleanup(*args, **kwargs):
+        phases.append("index")
+        await denied()
+        if failure == "index":
+            assert not await fs.exists(uri, ctx=ctx)
+            raise OSError("index cleanup refusal")
+        result = await delete(*args, **kwargs)
+        if await fs.exists(uri, ctx=ctx):
+            await denied()
+        else:
+            with pytest.raises(OpenVikingError) as absent:
+                await fs.read_file_bytes(member, ctx=outsider)
+            assert absent.value.code == "NOT_FOUND"
+        return result
+
+    monkeypatch.setattr(fs._async_agfs, "rm", remove)
+    monkeypatch.setattr(fs, "_delete_from_vector_store", cleanup)
+    if failure == "success":
+        assert await FSService(fs).remove_resource_only(uri, maintainer, recursive=directory) == {
+            "uri": uri,
+            "outcome": "removed",
+        }
+    elif failure == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await FSService(fs).remove_resource_only(uri, maintainer, recursive=directory)
+    else:
+        with pytest.raises(OpenVikingError) as error:
+            await FSService(fs).remove_resource_only(uri, maintainer, recursive=directory)
+        assert error.value.details == {"uri": uri, "outcome": "unknown"}
+    retained = failure in {"refusal", "cancel", "partial"}
+    assert await fs.exists(uri, ctx=ctx) == retained
+    if retained:
+        await denied()
+    assert bool(await backend.get_context_by_uri(uri, ctx=ctx)) == (failure != "success")
+    assert await backend.get(["foreign-remove"], ctx=foreign)
+    assert await backend.get(["sibling-remove"], ctx=ctx)
+    if failure == "success":
+        for expected_uri in expected_uris:
+            assert not await backend.get_context_by_uri(expected_uri, ctx=ctx)
+    expected_phases = ["native", "policy_checked"]
+    if failure in {"index", "success"}:
+        expected_phases.append("index")
+    assert phases == expected_phases
+    lease = await fs._async_agfs.pathlock_acquire_tree(
+        fs._uri_to_path("viking://resources", ctx=ctx)
+    )
+    await fs._async_agfs.pathlock_release(lease)
+
+
+@pytest.mark.parametrize("change", ["ownership", "recreate", "retained", "uncertain"])
+async def test_remove_requires_original_owner_identity_and_confirmed_absence(
+    enabled_tree, monkeypatch, change
+):
+    fs, backend, ctx, target, *_ = enabled_tree
+    uri = target + "/one.md"
+    await seed(backend, uri, ctx)
+    agfs = fs._async_agfs
+    path = fs._uri_to_path(uri, ctx=ctx)
+    native, acquire, release, stat = (
+        agfs.rm,
+        agfs.pathlock_acquire_batch,
+        agfs.pathlock_release,
+        agfs.stat,
+    )
+    leases, foreign, removed = [], [], False
+
+    async def remember(*args, **kwargs):
+        lease = await acquire(*args, **kwargs)
+        leases.append(lease)
+        return lease
+
+    async def remove(p, *args, **kwargs):
+        nonlocal removed
+        if p != path:
+            return await native(p, *args, **kwargs)
+        if change == "retained":
+            return {}
+        result = await native(p, *args, **kwargs)
+        removed = True
+        if change == "ownership":
+            for lease in reversed(leases):
+                await release(lease)
+            foreign.append(
+                await acquire(
+                    [{"path": fs._uri_to_path("viking://resources", ctx=ctx), "kind": "tree"}]
+                )
+            )
+        elif change == "recreate":
+            data = json.loads(await agfs.cat(ACCOUNTS_PATH))
+            data["accounts"][ctx.account_id]["creation_id"] = str(uuid4())
+            await agfs.write(ACCOUNTS_PATH, json.dumps(data).encode())
+        return result
+
+    async def uncertain(p, *args, **kwargs):
+        if p == path and removed and change == "uncertain":
+            raise OSError("absence is unknown")
+        return await stat(p, *args, **kwargs)
+
+    monkeypatch.setattr(agfs, "pathlock_acquire_batch", remember)
+    monkeypatch.setattr(agfs, "rm", remove)
+    monkeypatch.setattr(agfs, "stat", uncertain)
+    delete = AsyncMock(wraps=fs._delete_from_vector_store)
+    monkeypatch.setattr(fs, "_delete_from_vector_store", delete)
+    try:
+        with pytest.raises(OpenVikingError) as error:
+            await FSService(fs).remove_resource_only(uri, ctx)
+        assert error.value.details == {"uri": uri, "outcome": "unknown"}
+        delete.assert_not_called()
+        assert await backend.get(["orphan"], ctx=ctx)
+        for lease in foreign:
+            assert await agfs.pathlock_refresh(lease) == "refreshed"
+    finally:
+        for lease in foreign:
+            await release(lease)
+
+
+@pytest.mark.parametrize("during", [False, True])
+async def test_real_cancellation_preserves_restricted_retained_bytes(
+    enabled_tree, monkeypatch, during
+):
+    fs, backend, ctx, target, *_ = enabled_tree
+    uri = target + "/branch"
+    member = uri + "/two.md"
+    outsider = RequestContext(user=UserIdentifier(ctx.account_id, "outsider"), role=Role.USER)
+    grants = [{"principal": "user:" + ctx.user.user_id, "level": "manage"}]
+    await seed(backend, uri, ctx, "remove-policy")
+    await fs.set_acl(target, grants, ctx=ctx, acl_mode=AclMode.NONE)
+    await fs.set_acl(uri, grants, ctx=ctx, acl_mode=AclMode.RESTRICTED)
+    reached, wait = asyncio.Event(), asyncio.Event()
+    agfs, native = fs._async_agfs, fs._async_agfs.rm
+    path = fs._uri_to_path(uri, ctx=ctx)
+
+    async def pause(p, *args, **kwargs):
+        if p != path:
+            return await native(p, *args, **kwargs)
+        if during:
+            await native(
+                fs._uri_to_path(uri + "/deeper/three.md", ctx=ctx),
+                fs_ctx=kwargs["fs_ctx"],
+                auto_pathlock=False,
+            )
+        reached.set()
+        await wait.wait()
+        return await native(p, *args, **kwargs)
+
+    monkeypatch.setattr(agfs, "rm", pause)
+    task = asyncio.create_task(FSService(fs).remove_resource_only(uri, ctx, recursive=True))
+    try:
+        await asyncio.wait_for(reached.wait(), timeout=5)
+        with pytest.raises(OpenVikingError) as denied:
+            await fs.read_file_bytes(member, ctx=outsider)
+        assert denied.value.code == "PERMISSION_DENIED"
+        # A second owner cannot enter while cancellation is pending.
+        with pytest.raises(LockAcquisitionError):
+            await agfs.pathlock_acquire_tree(fs._uri_to_path("viking://resources", ctx=ctx))
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await raw(fs, member, ctx) == b"old two"
+        with pytest.raises(OpenVikingError) as denied:
+            await fs.read_file_bytes(member, ctx=outsider)
+        assert denied.value.code == "PERMISSION_DENIED"
+        assert await backend.get_context_by_uri(uri, ctx=ctx)
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    lease = await agfs.pathlock_acquire_tree(fs._uri_to_path("viking://resources", ctx=ctx))
+    await agfs.pathlock_release(lease)
+
+
+async def test_ordinary_resource_rm_keeps_policy_on_native_refusal(enabled_tree, monkeypatch):
+    fs, backend, ctx, target, *_ = enabled_tree
+    uri = target + "/one.md"
+    await seed(backend, uri, ctx, "ordinary-policy")
+    await fs.set_acl(
+        uri,
+        [{"principal": "user:" + ctx.user.user_id, "level": "manage"}],
+        ctx=ctx,
+        acl_mode=AclMode.RESTRICTED,
+    )
+    outsider = RequestContext(user=UserIdentifier(ctx.account_id, "outsider"), role=Role.USER)
+    native = fs._async_agfs.rm
+    path = fs._uri_to_path(uri, ctx=ctx)
+
+    async def refuse(p, *args, **kwargs):
+        if p == path:
+            with pytest.raises(OpenVikingError) as denied:
+                await fs.read_file_bytes(uri, ctx=outsider)
+            assert denied.value.code == "PERMISSION_DENIED"
+            raise OSError("native refusal")
+        return await native(p, *args, **kwargs)
+
+    monkeypatch.setattr(fs._async_agfs, "rm", refuse)
+    with pytest.raises(OSError):
+        await fs.rm(uri, ctx=ctx)
+    assert await raw(fs, uri, ctx) == b"old one"
+    with pytest.raises(OpenVikingError) as denied:
+        await fs.read_file_bytes(uri, ctx=outsider)
+    assert denied.value.code == "PERMISSION_DENIED"
+    assert await backend.get(["ordinary-policy"], ctx=ctx)

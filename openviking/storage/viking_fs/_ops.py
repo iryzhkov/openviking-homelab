@@ -288,7 +288,9 @@ class _OpsMixin:
         This method is idempotent: deleting a non-existent file succeeds
         after cleaning up any orphan index records.
 
-        Acquires a path lock, deletes VectorDB records, then FS files.
+        Acquires a path lock. Shared resources retain policy-bearing VectorDB
+        records until native removal confirms absence under the original owner.
+        Other namespaces delete VectorDB records before FS files.
         Raises ResourceBusyError when the target is locked by an ongoing
         operation (e.g. semantic processing).
 
@@ -431,7 +433,8 @@ class _OpsMixin:
             if not no_vector:
                 real_ctx = self._ctx_or_default(ctx)
                 estimated_count = await _estimate_deleted_count(path, real_ctx)
-                await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
+                if not resource_scope:
+                    await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
             try:
                 result = await self._async_agfs.rm(
                     path,
@@ -450,6 +453,30 @@ class _OpsMixin:
                         f"Directory not empty: {uri}. Use recursive=True to delete non-empty directories."
                     )
                 raise
+            if resource_scope and not no_vector:
+                # A failure, cancellation or lost native response never authorizes
+                # dropping restrictive policy, even if some bytes were removed.
+                # Keep the original identity and owner; never reacquire as a new owner.
+                from openviking.service.account_identity import recheck_account_identity
+
+                try:
+                    await self._async_agfs.stat(path)
+                except Exception as exc:
+                    if not is_not_found_error(exc):
+                        raise
+                else:
+                    raise ConflictError("Resource removal did not establish absence")
+                if await self._async_agfs.pathlock_refresh(lease) != "refreshed":
+                    raise ConflictError("Resource removal lost ownership")
+                await recheck_account_identity(
+                    self._account_identity_manager, self._ctx_or_default(ctx).account_id, admitted
+                )
+                await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
+                if await self._async_agfs.pathlock_refresh(lease) != "refreshed":
+                    raise ConflictError("Resource removal lost ownership")
+                await recheck_account_identity(
+                    self._account_identity_manager, self._ctx_or_default(ctx).account_id, admitted
+                )
             # Add estimated_deleted_count to the result
             if isinstance(result, dict):
                 result["estimated_deleted_count"] = estimated_count
