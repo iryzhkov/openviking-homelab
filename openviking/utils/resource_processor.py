@@ -1424,6 +1424,50 @@ class ResourceProcessor:
                 await output_store.cleanup(artifact_ref)
                 artifact_cleaned = True
 
+        async def refresh_file_parent() -> Dict[str, Any]:
+            nonlocal resource_lock
+            summarizer = await self._summarizer_for(ctx)
+            kwargs = {
+                "file_uri": file_refresh.file_uri,
+                "ctx": ctx,
+                "skip_vectorization": not build_index,
+                "ingest_options": ingest_options,
+                "created": not target_preexisting,
+                "file_md5": file_refresh.md5,
+                "file_abstract": "",
+            }
+            if not _resource_uri(root_uri):
+                return await summarizer.refresh_file_parent(**kwargs)
+            from openviking.storage.queuefs.resource_embedding_fence import (
+                bind_resource_semantic_admission,
+            )
+
+            if resource_lock is None:
+                raise ValueError("Resource file-parent admission lacks original ownership")
+            guard = PathLockGuard(get_viking_fs()._async_agfs, resource_lock)
+            try:
+                handoff = await guard.to_handoff()
+                if await get_viking_fs()._async_agfs.pathlock_refresh(guard.lease) != "refreshed":
+                    raise ValueError("Resource file-parent admission lost ownership")
+                await recheck_account_identity(
+                    get_viking_fs()._account_identity_manager,
+                    ctx.account_id,
+                    AccountIdentity(original_identity, False),
+                )
+                with bind_resource_semantic_admission(ctx.account_id, original_identity):
+                    return await guard.handoff_and_dispatch(
+                        handoff,
+                        lambda: summarizer.refresh_file_parent(**kwargs, lock_handoff=handoff),
+                        accepted=lambda result: (
+                            result.get("status") == "success"
+                            and result.get("enqueued_count", 0) > 0
+                        ),
+                    )
+            finally:
+                # Dispatch settles cancellation and records any reclaimed, rotated
+                # capability before the caller decides whether it still owns cleanup.
+                resource_lock = guard.lease
+
         capture_owner = self._prepared_index_owner(prepared, ctx, execution_owner=resource_lock)
         derived_enqueue_started_at = time.perf_counter()
         derived_enqueue_status = "ok"
@@ -1580,15 +1624,7 @@ class ResourceProcessor:
                         files=sync_deleted_files, dirs=sync_deleted_dirs, ctx=ctx
                     )
                 if should_refresh_file_parent:
-                    await (await self._summarizer_for(ctx)).refresh_file_parent(
-                        file_uri=file_refresh.file_uri,
-                        ctx=ctx,
-                        skip_vectorization=not build_index,
-                        ingest_options=ingest_options,
-                        created=not target_preexisting,
-                        file_md5=file_refresh.md5,
-                        file_abstract="",
-                    )
+                    await refresh_file_parent()
                 elif build_index and context_update_plan is None:
                     if root_is_file:
                         with bind_ingestion_source_type(source_type):
@@ -1607,18 +1643,11 @@ class ResourceProcessor:
                 await cleanup_artifact_if_owned()
                 raise
             finally:
-                await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
+                if resource_lock is not None:
+                    await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
         elif should_refresh_file_parent:
             try:
-                await (await self._summarizer_for(ctx)).refresh_file_parent(
-                    file_uri=file_refresh.file_uri,
-                    ctx=ctx,
-                    skip_vectorization=not build_index,
-                    ingest_options=ingest_options,
-                    created=not target_preexisting,
-                    file_md5=file_refresh.md5,
-                    file_abstract="",
-                )
+                await refresh_file_parent()
             except BaseException:
                 await cleanup_artifact_if_owned()
                 raise
