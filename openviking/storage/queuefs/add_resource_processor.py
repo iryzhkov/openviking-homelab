@@ -51,8 +51,18 @@ class AddResourceProcessor(DequeueHandlerBase):
 
     async def _load_lock(self, msg: AddResourceMsg, ctx: RequestContext) -> Any:
         """Adopt a pathlock handoff ref, returning an owned lease dict."""
+        from openviking.storage.queuefs.resource_embedding_fence import _resource_uri
+
+        resource_job = bool(msg.resource_creation_identity) or _resource_uri(msg.root_uri)
         if msg.lock_handoff is None:
+            if resource_job:
+                raise ValueError("Resource job lacks its original lock handoff")
             return None
+        if resource_job:
+            # Only the original handoff carries this job's reservation and
+            # plan authority. A lost handoff fails closed; a fresh lease would
+            # upgrade a stale job into new authority over the target.
+            return await self._viking_fs._async_agfs.pathlock_adopt(msg.lock_handoff)
         try:
             return await self._viking_fs._async_agfs.pathlock_adopt(msg.lock_handoff)
         except Exception as handoff_error:
