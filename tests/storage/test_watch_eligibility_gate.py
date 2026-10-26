@@ -153,7 +153,9 @@ def _variants(ctx, primary):
     ["equal", "ancestor", "descendant", "paused", "connector",
      "no_target_overlapping_parent", "no_target_unknown_parent"],
 )
-async def test_overlapping_watch_refuses_before_any_effect(enabled_tree, monkeypatch, site, variant):
+async def test_overlapping_watch_refuses_before_any_effect(
+    enabled_tree, monkeypatch, site, variant
+):
     fs, backend, ctx, target, *_ = enabled_tree
     if site == "prune":
         await seed_orphan(backend, target + "/orphan", ctx)
