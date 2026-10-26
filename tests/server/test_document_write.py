@@ -62,6 +62,13 @@ async def test_http_private_parser_and_contract(admitted_service, app, client, m
     ctx = _root_ctx()
     app.dependency_overrides[get_request_context] = lambda: ctx
     seen = []
+    excluded_links = []
+
+    async def excluded_link(*args, **kwargs):
+        excluded_links.append(True)
+        raise AssertionError("resources-only writes must not link excluded memory")
+
+    monkeypatch.setattr(service.resources, "_link_resource_reason_memory", excluded_link)
     original = UnifiedResourceProcessor.process
 
     async def process(self, *args, **kwargs):
@@ -137,6 +144,7 @@ async def test_http_private_parser_and_contract(admitted_service, app, client, m
     assert replaced["backup"]["node"]["kind"] == "directory"
     assert replaced["processing_state"] == "accepted"
     await settle(service)
+    assert excluded_links == []
 
 
 async def test_raw_preservation_and_protected_backup(admitted_service, monkeypatch):
@@ -272,6 +280,65 @@ async def test_stale_controls_and_same_process_rollback(admitted_service, monkey
     assert raised.value.details["content_state"] == "rolled_back", raised.value.details
     assert raised.value.details["retained_copies"][0]["uri"] == BACKUP
     assert (await document_node(service, TARGET, ctx))["node"] == expected
+
+
+async def test_conflicting_acl_refuses_before_private_preparation(admitted_service, monkeypatch):
+    from openviking.service import document_write
+    from openviking.storage.vector_ids import vector_record_id
+    from openviking_cli.exceptions import FailedPreconditionError
+
+    service = admitted_service
+    fs = service.viking_fs
+    ctx = _root_ctx()
+    await fs.mkdir(TARGET, ctx=ctx)
+    await fs.write_file_bytes(TARGET + "/original.md", b"original body", ctx=ctx)
+    rows = []
+    for level in (0, 1):
+        rows.append(
+            {
+                "id": vector_record_id(ctx.account_id, TARGET, level),
+                "uri": TARGET,
+                "level": level,
+                "account_id": ctx.account_id,
+                "abstract": "original",
+                "vector": [0.1] * 2048,
+                "acl_mode": "restricted" if level == 0 else "inherit",
+                "acl_direct_grants": ["7:user:" + ctx.user.user_id] if level == 0 else [],
+                "acl_inherited_grants": ["7:user:*"],
+            }
+        )
+    await fs._get_vector_store()._upsert_many_raw(rows, ctx=ctx)
+    before = (await document_node(service, TARGET, ctx))["node"]
+    request = DocumentWriteRequest(
+        target_uri=TARGET,
+        source_name="replacement.md",
+        text="replacement",
+        expected=before,
+        backup_uri=BACKUP,
+    )
+    assert request.expected.kind == "directory"
+    preparation_calls = []
+    publication_calls = []
+
+    async def forbid_prepare(*args, **kwargs):
+        preparation_calls.append(True)
+        raise AssertionError("conflicting ACLs must refuse before private preparation")
+
+    async def forbid_publication(*args, **kwargs):
+        publication_calls.append(True)
+        raise AssertionError("conflicting ACLs must refuse before publication")
+
+    monkeypatch.setattr(document_write, "_prepare", forbid_prepare)
+    monkeypatch.setattr(document_write, "_publish_records", forbid_publication)
+    monkeypatch.setattr(fs, "write_file_bytes", forbid_publication)
+    with pytest.raises(FailedPreconditionError) as refused:
+        await write_document(service, request, ctx)
+    assert refused.value.details["content_state"] == "not_started"
+    assert preparation_calls == []
+    assert publication_calls == []
+    assert (await document_node(service, TARGET, ctx))["node"] == before
+    assert await fs.read_file_bytes(TARGET + "/original.md", ctx=ctx) == b"original body"
+    assert (await document_node(service, BACKUP, ctx))["node"] == {"kind": "absent"}
 
 
 def test_closed_wire_shapes():
