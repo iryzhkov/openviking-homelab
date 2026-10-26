@@ -254,10 +254,15 @@ class DirectoryInitializer:
         self, roots: Sequence[_DirectoryTarget], children: Sequence[_DirectoryTarget]
     ) -> list[_DirectoryTarget]:
         """Initialize roots before children and index successful writes as one batch."""
-        results = await asyncio.gather(
-            *(self._ensure_agfs_directory(target) for target in roots),
-            return_exceptions=True,
-        )
+        # Cold sibling roots share a missing account parent. Ensure them in
+        # order so their native Exact parent leases do not contend with each other.
+        # Keep return_exceptions semantics: later roots still run after a failure,
+        # and the existing partition/index path preserves every successful root.
+        results = []
+        for target in roots:
+            results.extend(
+                await asyncio.gather(self._ensure_agfs_directory(target), return_exceptions=True)
+            )
         created, error = self._partition_directory_results(results)
         if error is None:
             results = await asyncio.gather(
