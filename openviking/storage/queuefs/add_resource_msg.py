@@ -64,8 +64,14 @@ class AddResourceMsg:
     tag_mode: str = "replace"
     acl: Optional[Dict[str, Any]] = None
     internal_task: bool = False
+    resource_creation_identity: Optional[str] = None
 
     def __post_init__(self) -> None:
+        if self.resource_creation_identity is not None and (
+            type(self.resource_creation_identity) is not str
+            or not self.resource_creation_identity.strip()
+        ):
+            raise ValueError("resource_creation_identity must be a non-empty string")
         inferred = (
             AddResourcePhase.POST_PROCESS if self.prepared is not None else AddResourcePhase.SOURCE
         )
@@ -235,4 +241,5 @@ class AddResourceMsg:
             tags=(list(data["tags"]) if isinstance(data.get("tags"), list) else None),
             tag_mode=str(data.get("tag_mode") or "replace"),
             internal_task=bool(data.get("internal_task", False)),
+            resource_creation_identity=data.get("resource_creation_identity"),
         )
