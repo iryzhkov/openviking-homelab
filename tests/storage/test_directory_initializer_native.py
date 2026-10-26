@@ -53,7 +53,7 @@ async def test_initializer_foreign_account_tree_refuses_without_creating_childre
     try:
         with pytest.raises(OSError) as raised:
             await initializer.initialize_account_workspace(ctx)
-        assert isinstance(raised.value.__cause__, LockAcquisitionError)
+        assert isinstance(raised.value.__context__, LockAcquisitionError)
         for uri in ("viking://resources", "viking://agent", "viking://user", canonical_user_root(ctx)):
             assert not await fs.exists(uri, ctx=ctx)
         assert not db.embedding_messages and not db.get_calls
@@ -73,7 +73,7 @@ async def test_initializer_preserves_and_indexes_successes_then_raises_first_nat
         with pytest.raises(OSError) as raised:
             await initializer.initialize_account_workspace(ctx)
         assert blocked[0] in str(raised.value)
-        assert isinstance(raised.value.__cause__, LockAcquisitionError)
+        assert isinstance(raised.value.__context__, LockAcquisitionError)
         user_root = canonical_user_root(ctx)
         successful = {"viking://resources", "viking://agent", user_root} - set(blocked)
         assert {msg.context_data["uri"] for msg in db.embedding_messages} == successful
