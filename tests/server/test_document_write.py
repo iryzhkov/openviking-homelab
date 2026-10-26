@@ -350,6 +350,257 @@ async def test_conflicting_acl_refuses_before_private_preparation(admitted_servi
     assert (await document_node(service, BACKUP, ctx))["node"] == {"kind": "absent"}
 
 
+@pytest.mark.parametrize("kind", ["file", "directory"])
+async def test_unindexed_original_rollback(admitted_service, monkeypatch, kind):
+    from openviking.service import document_write
+
+    service, ctx = admitted_service, _root_ctx()
+    fs = service.viking_fs
+    parent, target = BASE + "/private", BASE + "/private/original"
+    await fs.mkdir(parent, ctx=ctx)
+    row = document_write._root_record(parent, 0, ctx, True)
+    row["vector"] = [0.1] * 2048
+    await fs._get_vector_store().upsert(row, ctx=ctx)
+    await service.runtime_config_manager.patch_account(ctx.account_id, {"acl": {"enabled": True}})
+    await fs.set_acl(
+        parent,
+        [{"principal": "user:" + ctx.user.user_id, "level": "manage"}],
+        acl_mode=AclMode.RESTRICTED,
+        ctx=ctx,
+    )
+    if kind == "directory":
+        await fs.mkdir(target, ctx=ctx)
+    member = target + "/original.md" if kind == "directory" else target
+    await fs.write_file_bytes(member, b"original exact\r\n ", ctx=ctx)
+    expected = (await document_node(service, target, ctx))["node"]
+    assert await document_write._records(fs, target, ctx) == []
+    outsider = RequestContext(user=UserIdentifier(ctx.account_id, "outsider"), role=Role(Role.USER))
+    original_write = fs.write_file_bytes
+    first_bytes, phases, embedded = [], [], []
+    original_embed = type(fs.query_embedder).embed
+
+    def embed(self, *args, **kwargs):
+        assert "install" not in phases, "rollback must not call the model"
+        embedded.append(args[0])
+        return original_embed(self, *args, **kwargs)
+
+    async def protected_write(uri, data, *args, **kwargs):
+        result = await original_write(uri, data, *args, **kwargs)
+        if uri == member or uri == BACKUP or uri.startswith(BACKUP + "/"):
+            with pytest.raises(PermissionDeniedError):
+                await fs.read_file_bytes(uri, ctx=outsider)
+            first_bytes.append(uri)
+        return result
+
+    async def fault(phase):
+        phases.append(phase)
+        if phase == "install":
+            raise OSError("one-shot install fault")
+
+    monkeypatch.setattr(type(fs.query_embedder), "embed", embed)
+    monkeypatch.setattr(fs, "write_file_bytes", protected_write)
+    with pytest.raises(OpenVikingError) as raised:
+        await write_document(
+            service,
+            DocumentWriteRequest(
+                target_uri=target,
+                source_name="replacement.md",
+                text="new body",
+                expected=expected,
+                backup_uri=BACKUP,
+                representation="raw_file" if kind == "file" else "ingest",
+            ),
+            ctx,
+            fault=fault,
+        )
+    assert "install" in phases
+    assert raised.value.details["content_state"] == "rolled_back", raised.value.details
+    assert (await document_node(service, target, ctx))["node"] == expected
+    assert await fs.read_file_bytes(member, ctx=ctx) == b"original exact\r\n "
+    backup_member = BACKUP + "/original.md" if kind == "directory" else BACKUP
+    assert await fs.read_file_bytes(backup_member, ctx=ctx) == b"original exact\r\n "
+    assert (await document_node(service, BACKUP, ctx))["node"] == raised.value.details[
+        "retained_copies"
+    ][0]["node"]
+    assert await document_write._records(fs, target, ctx) == []
+    assert member in first_bytes and backup_member in first_bytes
+    assert any(value.startswith(target + "\n") for value in embedded)
+
+
+@pytest.mark.parametrize("input_path", ["context", "physical"])
+async def test_document_node_hides_denied_descendant(
+    admitted_service, app, client, monkeypatch, input_path
+):
+    from openviking.service import document_write
+
+    service, ctx = admitted_service, _root_ctx()
+    fs = service.viking_fs
+    hidden = TARGET + "/classified-child.md"
+    await fs.mkdir(TARGET, ctx=ctx)
+    await fs.write_file_bytes(hidden, b"secret", ctx=ctx)
+    await service.runtime_config_manager.patch_account(ctx.account_id, {"acl": {"enabled": True}})
+    row = document_write._root_record(hidden, 2, ctx, False)
+    row.update(
+        vector=[0.1] * 2048,
+        acl_mode="restricted",
+        acl_direct_grants=["7:user:" + ctx.user.user_id],
+        acl_inherited_grants=[],
+    )
+    await fs._get_vector_store()._upsert_many_raw([row], ctx=ctx)
+    reader = RequestContext(user=UserIdentifier(ctx.account_id, "reader"), role=Role(Role.USER))
+    await fs._ensure_access(TARGET, reader, action=document_write.AclAction.READ)
+    if input_path == "physical":
+
+        async def no_context(*args, **kwargs):
+            return []
+
+        monkeypatch.setattr(document_write, "_records", no_context)
+    with pytest.raises(PermissionDeniedError) as raised:
+        await document_node(service, TARGET, reader)
+    error = raised.value
+    assert "classified-child" not in str(error) + repr(error.details)
+    assert error.__cause__ is None and error.__context__ is None
+    app.dependency_overrides[get_request_context] = lambda: reader
+    response = await client.get("/api/v1/resources/document-node", params={"uri": TARGET})
+    assert response.status_code == 403, response.text
+    assert "classified-child" not in response.text
+    assert TARGET in response.text
+
+
+async def test_duplicate_slot_controls_refuse_before_effects(admitted_service, monkeypatch):
+    from openviking.service import document_write
+    from openviking_cli.exceptions import FailedPreconditionError
+
+    service, ctx = admitted_service, _root_ctx()
+    fs = service.viking_fs
+    await fs.write_file_bytes(TARGET, b"original", ctx=ctx)
+    rows = []
+    for index, tag in enumerate(("first", "second")):
+        row = document_write._root_record(TARGET, 2, ctx, False)
+        row.update(
+            id="duplicate-control-" + str(index), vector=[0.1] * 2048, search_tags=[tag], tags=tag
+        )
+        rows.append(row)
+    await fs._get_vector_store()._upsert_many_raw(rows, ctx=ctx)
+    actual = await document_write._records(fs, TARGET, ctx)
+    assert len(actual) == 2
+    before = (await document_node(service, TARGET, ctx))["node"]
+    effects = []
+
+    async def forbidden(*args, **kwargs):
+        effects.append(True)
+        raise AssertionError("ambiguous controls must refuse before preparation/effects")
+
+    monkeypatch.setattr(document_write, "_prepare", forbidden)
+    monkeypatch.setattr(document_write, "_publish_records", forbidden)
+    monkeypatch.setattr(fs, "write_file_bytes", forbidden)
+    with pytest.raises(FailedPreconditionError) as raised:
+        await write_document(
+            service,
+            DocumentWriteRequest(
+                target_uri=TARGET,
+                source_name="replacement.md",
+                text="new",
+                representation="raw_file",
+                expected=before,
+                backup_uri=BACKUP,
+            ),
+            ctx,
+        )
+    assert raised.value.details["content_state"] == "not_started"
+    assert effects == []
+    assert (await document_node(service, TARGET, ctx))["node"] == before
+    assert await document_write._records(fs, TARGET, ctx) == actual
+    assert await fs.read_file_bytes(TARGET, ctx=ctx) == b"original"
+    assert (await document_node(service, BACKUP, ctx))["node"] == {"kind": "absent"}
+
+
+async def test_backup_sidecars_map_and_rollback_exact(admitted_service, monkeypatch):
+    from openviking.service import document_write
+    from openviking.storage.abstract_overview import (
+        parse_abstract_overview,
+        render_abstract_overview,
+        rewrite_abstract_overview_for_transfer,
+    )
+
+    service, ctx = admitted_service, _root_ctx()
+    fs = service.viking_fs
+    await fs.mkdir(TARGET, ctx=ctx)
+    await fs.write_file_bytes(TARGET + "/original.md", b"original body", ctx=ctx)
+    row = document_write._root_record(TARGET, 0, ctx, True)
+    row.update(vector=[0.1] * 2048, search_tags=["retained"])
+    await fs._get_vector_store().upsert(row, ctx=ctx)
+    await service.runtime_config_manager.patch_account(ctx.account_id, {"acl": {"enabled": True}})
+    await fs.set_acl(
+        TARGET,
+        [{"principal": "user:" + ctx.user.user_id, "level": "manage"}],
+        acl_mode=AclMode.RESTRICTED,
+        ctx=ctx,
+    )
+    originals = {}
+    for level, name in ((0, ".abstract.md"), (1, ".overview.md")):
+        raw = render_abstract_overview(level, TARGET, "[old](" + TARGET + "/original.md)\n", {})
+        originals[name] = raw.encode()
+        await fs.write_file_bytes(TARGET + "/" + name, raw.encode(), ctx=ctx)
+    before = (await document_node(service, TARGET, ctx))["node"]
+    old_records = await document_write._records(fs, TARGET, ctx)
+    outsider = RequestContext(user=UserIdentifier(ctx.account_id, "outsider"), role=Role(Role.USER))
+    write = fs.write_file_bytes
+    checked = []
+
+    async def protected_write(uri, data, *args, **kwargs):
+        result = await write(uri, data, *args, **kwargs)
+        if uri.startswith(TARGET + "/") or uri.startswith(BACKUP + "/"):
+            with pytest.raises(PermissionDeniedError):
+                await fs.read_file_bytes(uri, ctx=outsider)
+            checked.append(uri)
+        return result
+
+    async def fault(phase):
+        if phase == "install":
+            raise OSError("one-shot install fault")
+
+    monkeypatch.setattr(fs, "write_file_bytes", protected_write)
+    with pytest.raises(OpenVikingError) as raised:
+        await write_document(
+            service,
+            DocumentWriteRequest(
+                target_uri=TARGET,
+                source_name="replacement.md",
+                text="# New\n\nNew body.",
+                expected=before,
+                backup_uri=BACKUP,
+            ),
+            ctx,
+            fault=fault,
+        )
+    assert raised.value.details["content_state"] == "rolled_back", raised.value.details
+    assert (await document_node(service, TARGET, ctx))["node"] == before
+    assert await document_write._records(fs, TARGET, ctx) == old_records
+    backup = (await document_node(service, BACKUP, ctx))["node"]
+    assert backup == raised.value.details["retained_copies"][0]["node"]
+    assert backup != before
+    for level, name in ((0, ".abstract.md"), (1, ".overview.md")):
+        assert await fs.read_file_bytes(TARGET + "/" + name, ctx=ctx) == originals[name]
+        actual = await fs.read_file_bytes(BACKUP + "/" + name, ctx=ctx)
+        assert (
+            actual
+            == rewrite_abstract_overview_for_transfer(
+                originals[name],
+                level=level,
+                source_dir_uri=TARGET,
+                target_dir_uri=BACKUP,
+                source_scope_uri=TARGET,
+                target_scope_uri=BACKUP,
+            ).encode()
+        )
+        parsed = parse_abstract_overview(actual)
+        assert parsed.metadata["directory"] == BACKUP + "/"
+        assert BACKUP + "/original.md" in parsed.body
+        assert TARGET + "/original.md" not in parsed.body
+        assert TARGET + "/" + name in checked and BACKUP + "/" + name in checked
+
+
 def test_closed_wire_shapes():
     from pydantic import ValidationError
 

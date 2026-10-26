@@ -29,6 +29,10 @@ from openviking.parse.output import (
 from openviking.server.error_mapping import is_not_found_error
 from openviking.service import tree_replace
 from openviking.service.account_identity import recheck_account_identity
+from openviking.storage.abstract_overview import (
+    ABSTRACT_OVERVIEW_FILENAMES,
+    rewrite_abstract_overview_for_transfer,
+)
 from openviking.storage.acl import AclAction, AclMode
 from openviking.storage.context_update_plan import (
     build_context_update_plan_from_snapshot,
@@ -51,6 +55,7 @@ from openviking_cli.exceptions import (
     FailedPreconditionError,
     InvalidArgumentError,
     OpenVikingError,
+    PermissionDeniedError,
     ResourceExhaustedError,
 )
 from openviking_cli.utils.config import get_openviking_config
@@ -181,7 +186,9 @@ async def _records(fs, uri, ctx):
         for row in rows
     ):
         raise FailedPreconditionError("Document context inventory incomplete")
-    await fs._ensure_access_many([uri, *(row["uri"] for row in rows)], ctx, action=AclAction.READ)
+    await tree_replace._require_tree_access(
+        fs, uri, [row["uri"] for row in rows], ctx, AclAction.READ
+    )
     return deepcopy(rows)
 
 
@@ -204,6 +211,15 @@ def _descriptor(uri, entries, records, bodies, kind):
 
 
 async def _snapshot(fs, uri, ctx, lease, *, owned_absence=False):
+    try:
+        return await _snapshot_inputs(fs, uri, ctx, lease, owned_absence=owned_absence)
+    except PermissionDeniedError:
+        pass
+    # Raise outside the handler so even the exception context cannot name a child.
+    raise PermissionDeniedError("Tree contains inaccessible entries", resource=uri)
+
+
+async def _snapshot_inputs(fs, uri, ctx, lease, *, owned_absence=False):
     await fs._ensure_access(uri, ctx, action=AclAction.READ)
     records = await _records(fs, uri, ctx)
     path = fs._uri_to_path(uri, ctx=ctx)
@@ -292,12 +308,17 @@ def _controls_for_level(old):
 
 def _validate_acl_snapshots(records):
     policies = {}
+    slots = {}
     for row in records:
         fields = tree_replace._controls(row)
         policy = (fields["acl_mode"], tuple(fields["acl_direct_grants"]))
         if row["uri"] in policies and policies[row["uri"]] != policy:
             raise FailedPreconditionError("Document controls contain conflicting ACL snapshots")
         policies[row["uri"]] = policy
+        slot = (row["uri"], row.get("level"))
+        if slot in slots and slots[slot] != fields:
+            raise FailedPreconditionError("Document controls contain conflicting snapshots")
+        slots[slot] = fields
 
 
 async def _target_records(fs, uri, inventory, old, root_is_file, ctx):
@@ -501,6 +522,30 @@ async def _embed_private_records(fs, records, root_uri, bodies, ctx, admitted, l
 
 
 async def _copy_snapshot(fs, source, destination, old, records, ctx, lease):
+    entries, bodies = old.entries, old.bodies
+    if old.node["kind"] == "directory" and source != destination:
+        entries = await tree_replace._expected_transfer_entries(
+            fs,
+            source,
+            destination,
+            old.entries,
+            fs._pathlock_fs_ctx(ctx, lease),
+            source_path=fs._uri_to_path(source, ctx=ctx),
+        )
+        bodies = dict(old.bodies)
+        for rel, raw in old.bodies.items():
+            parent, _, name = rel.rpartition("/")
+            if name in ABSTRACT_OVERVIEW_FILENAMES:
+                bodies[rel] = rewrite_abstract_overview_for_transfer(
+                    raw,
+                    level=ContextLevel.ABSTRACT
+                    if name == ".abstract.md"
+                    else ContextLevel.OVERVIEW,
+                    source_dir_uri=source + "/" + parent if parent else source,
+                    target_dir_uri=destination + "/" + parent if parent else destination,
+                    source_scope_uri=source,
+                    target_scope_uri=destination,
+                ).encode("utf-8")
     published = await _publish_records(fs, destination, records, ctx)
     if old.node["kind"] == "directory":
         await fs._mkdir_transfer_root_exclusive(
@@ -509,10 +554,10 @@ async def _copy_snapshot(fs, source, destination, old, records, ctx, lease):
         for entry in old.entries:
             if entry["type"] == "dir":
                 await fs.mkdir(destination + "/" + entry["path"], ctx=ctx, lease_ref=lease)
-    for rel, raw in old.bodies.items():
+    for rel, raw in bodies.items():
         target = destination + "/" + rel if rel else destination
         await fs.write_file_bytes(target, raw, ctx=ctx, lease_ref=lease)
-    expected = _descriptor(destination, old.entries, published, old.bodies, old.node["kind"])
+    expected = _descriptor(destination, entries, published, bodies, old.node["kind"])
     await tree_replace._finish_context_copy(fs, destination, records, ctx)
     actual = await _snapshot(fs, destination, ctx, lease)
     if actual.node != expected:
@@ -556,6 +601,7 @@ async def _write_document(service, request, ctx, *, fault):
     original = None
     backup = None
     backup_started = False
+    recovery_records = []
     mutated = False
     committed = False
 
@@ -676,6 +722,18 @@ async def _write_document(service, request, ctx, *, fault):
                             ),
                         ]
                     anchor = await fs.acl_manager.resolve(uri, ctx)
+                    recovery_records = deepcopy(old_records)
+                    if not any(row["uri"] == uri for row in original.records):
+                        _, recovery_records = await fs.acl_manager.prepare_subtree_records(
+                            uri,
+                            recovery_records,
+                            ctx,
+                            root_direct=anchor.permissions,
+                            root_mode=AclMode.RESTRICTED,
+                        )
+                    await _embed_private_records(
+                        fs, recovery_records, uri, original.bodies, ctx, admitted, lease
+                    )
                     backup_records = await tree_replace._prepare_context_copy(
                         fs, uri, request.backup_uri, old_records, ctx, anchor=anchor
                     )
@@ -696,6 +754,12 @@ async def _write_document(service, request, ctx, *, fault):
                         lease,
                     )
                     await step("backup")
+                    if (await _snapshot(fs, uri, ctx, lease)).node != original.node:
+                        raise ConflictError("Document expectation changed")
+                    if (await _snapshot(fs, request.backup_uri, ctx, lease)).node[
+                        "kind"
+                    ] != "absent":
+                        raise ConflictError("Document backup destination is occupied")
                     backup_started = True
                     backup = await _copy_snapshot(
                         fs, uri, request.backup_uri, original, backup_records, ctx, lease
@@ -822,24 +886,7 @@ async def _write_document(service, request, ctx, *, fault):
                 if backup is not None:
                     if (await _snapshot(fs, request.backup_uri, ctx, lease)).node != backup.node:
                         raise RuntimeError("Document backup changed")
-                    protected = original.records
-                    if not any(row["uri"] == uri for row in protected):
-                        protected = [
-                            _root_record(
-                                uri,
-                                2 if original.node["kind"] == "file" else 0,
-                                ctx,
-                                original.node["kind"] == "directory",
-                            ),
-                            *protected,
-                        ]
-                        if await fs._acl_enabled(ctx):
-                            _, protected = await fs.acl_manager.prepare_subtree_records(
-                                uri, protected, ctx
-                            )
-                    await _copy_snapshot(
-                        fs, request.backup_uri, uri, original, protected, ctx, lease
-                    )
+                    await _copy_snapshot(fs, uri, uri, original, recovery_records, ctx, lease)
                     await tree_replace._finish_context_copy(fs, uri, original.records, ctx)
                 else:
                     await tree_replace._finish_context_copy(fs, uri, [], ctx)
