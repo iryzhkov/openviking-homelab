@@ -59,6 +59,10 @@ class AddResourceProcessor(DequeueHandlerBase):
                 raise ValueError("Resource job lacks its original lock handoff")
             return None
         if resource_job:
+            if msg.prepared is not None:
+                from openviking.utils.resource_processor import ResourceProcessor
+
+                ResourceProcessor._prepared_index_owner(msg.prepared, ctx, handoff=msg.lock_handoff)
             # Only the original handoff carries this job's reservation and
             # plan authority. A lost handoff fails closed; a fresh lease would
             # upgrade a stale job into new authority over the target.

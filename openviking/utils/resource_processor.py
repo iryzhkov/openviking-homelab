@@ -1247,6 +1247,68 @@ class ResourceProcessor:
 
             return result
 
+    @staticmethod
+    def _prepared_index_owner(prepared, ctx, *, handoff=None, execution_owner=None):
+        """Validate capture authority separately from the rotated execution capability."""
+        from openviking.storage.context_update_plan import ContextUpdatePlan
+        from openviking.storage.queuefs.resource_embedding_fence import (
+            ResourceEmbeddingConflict,
+            _resource_uri,
+        )
+
+        plan_data = prepared.get("context_update_plan")
+        if not _resource_uri(prepared.get("root_uri")) or not plan_data:
+            return None
+        actions = ContextUpdatePlan.from_dict(plan_data).direct_index_actions
+        if not actions:
+            return None
+        conditions = prepared.get("resource_index_conditions")
+        if not isinstance(conditions, dict):
+            raise ResourceEmbeddingConflict("Prepared index plan lacks original conditions")
+        owner = None
+        for action in actions:
+            proof = conditions.get(f"{action.action.value}:{action.record_id}")
+            if not isinstance(proof, dict) or (
+                proof.get("account_id"),
+                proof.get("creation_identity"),
+                proof.get("uri"),
+                proof.get("level"),
+                proof.get("record_id"),
+                proof.get("action"),
+            ) != (
+                ctx.account_id,
+                prepared.get("resource_creation_identity"),
+                action.uri,
+                action.level,
+                action.record_id,
+                action.action.value,
+            ):
+                raise ResourceEmbeddingConflict("Prepared index plan changed after capture")
+            captured = proof.get("owner")
+            if (
+                not isinstance(captured, dict)
+                or captured.get("owned") is not True
+                or any(
+                    not isinstance(captured.get(key), str) or not captured[key]
+                    for key in ("lease_ref", "ownership_ref", "owner_id")
+                )
+                or not isinstance(captured.get("lock_paths"), list)
+                or not captured["lock_paths"]
+                or any(not isinstance(path, str) or not path for path in captured["lock_paths"])
+                or (owner is not None and captured != owner)
+            ):
+                raise ResourceEmbeddingConflict("Prepared index plan lacks original capture owner")
+            owner = captured
+        if handoff is not None and any(
+            owner.get(key) != handoff.get(key) for key in ("lease_ref", "owner_id", "lock_paths")
+        ):
+            raise ResourceEmbeddingConflict("Prepared index capture owner differs from handoff")
+        if execution_owner is not None and any(
+            owner.get(key) != execution_owner.get(key) for key in ("owner_id", "lock_paths")
+        ):
+            raise ResourceEmbeddingConflict("Prepared index capture owner differs from execution")
+        return owner
+
     async def finish_prepared_resource(
         self,
         prepared: Dict[str, Any],
@@ -1362,6 +1424,7 @@ class ResourceProcessor:
                 await output_store.cleanup(artifact_ref)
                 artifact_cleaned = True
 
+        capture_owner = self._prepared_index_owner(prepared, ctx, execution_owner=resource_lock)
         derived_enqueue_started_at = time.perf_counter()
         derived_enqueue_status = "ok"
         try:
@@ -1384,7 +1447,7 @@ class ResourceProcessor:
                             ctx=ctx,
                             ingest_options=ingest_options,
                             resource_conditions=prepared.get("resource_index_conditions"),
-                            owner_lease_ref=resource_lock,
+                            owner_lease_ref=capture_owner,
                         )
 
                 if should_summarize:
