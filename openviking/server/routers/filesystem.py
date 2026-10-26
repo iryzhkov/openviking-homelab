@@ -298,6 +298,22 @@ async def mkdir(
     return Response(status="ok", result={"uri": uri})
 
 
+@router.get("/resources-only/mutation-contract")
+async def resource_mutation_contract(
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Identify the additive conditional resource-document protocol.
+
+    This is a wire-contract version, not source/native artifact attestation or
+    an assertion that every document operation and input shape is supported.
+    Clients must still enforce their grants and each operation's preconditions.
+    """
+    return Response(
+        status="ok",
+        result={"contract": "resources-document-mutations", "version": 1},
+    )
+
+
 class ResourceOnlyRemoveRequest(BaseModel):
     """Remove exactly one resource node or explicitly selected subtree."""
 
