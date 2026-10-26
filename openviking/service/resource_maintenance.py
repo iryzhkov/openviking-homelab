@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Resource maintenance without extraction, refresh, watch, version or task effects."""
 
+from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.error_mapping import is_not_found_error, map_exception
 from openviking.server.identity import RequestContext
 from openviking.storage.acl import AclAction
@@ -14,6 +15,7 @@ from openviking_cli.exceptions import (
     InvalidArgumentError,
     NotFoundError,
     OpenVikingError,
+    PermissionDeniedError,
 )
 
 
@@ -30,6 +32,9 @@ def validate_resource_target(uri: str) -> str:
         raise InvalidArgumentError(
             "Empty, relative and storage-internal path segments are not allowed"
         )
+    # Watch control state lives in the resources tree but is never a resource.
+    if is_watch_task_control_uri(uri):
+        raise PermissionDeniedError("watch-task control state cannot be maintained", resource=uri)
     # Reject alternate spellings rather than silently broadening the target.
     if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in uri) or any(
         c in uri for c in ("\\", "%", "?", "#", "{", "}")

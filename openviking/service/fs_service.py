@@ -551,15 +551,103 @@ class FSService:
             validate_resource_target,
         )
         validate_resource_target(uri)
-        return await maintain_resource(self._ensure_initialized(), uri, ctx, recursive=recursive)
+        return await self._maintain_unwatched_resource(uri, ctx, recursive=recursive)
 
     async def prune_resource_index(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
-        from openviking.service.resource_maintenance import (
-            maintain_resource,
-            validate_resource_target,
-        )
+        from openviking.service.resource_maintenance import validate_resource_target
+
         validate_resource_target(uri)
-        return await maintain_resource(self._ensure_initialized(), uri, ctx, prune=True)
+        return await self._maintain_unwatched_resource(uri, ctx, prune=True)
+
+    async def _maintain_unwatched_resource(
+        self, uri: str, ctx: RequestContext, *, recursive: bool = False, prune: bool = False,
+    ) -> Dict[str, Any]:
+        """Run resources-only maintenance under the URI mutation lease.
+
+        The lease excludes same-process watch creation, retargeting, deletion and
+        executing ticks for the whole call. Authorization runs before the watch
+        gate, so a conflict never reveals a watch to an unauthorized caller.
+        Prune of an absent watched target is refused too: a Connector watch
+        recreates its target on the next tick.
+        """
+        from openviking.service.resource_maintenance import maintain_resource
+
+        viking_fs = self._ensure_initialized()
+        async with self._uri_mutation_coordinator.mutation(ctx.account_id, [uri]):
+            await viking_fs._ensure_access(uri, ctx, action=AclAction.MANAGE)
+            await viking_fs._ensure_access(uri, ctx, action=AclAction.WRITE)
+            await self._refuse_watched_resource_targets(ctx, [uri])
+            return await maintain_resource(
+                viking_fs, uri, ctx, recursive=recursive, prune=prune
+            )
+
+    async def _refuse_watched_resource_targets(
+        self, ctx: RequestContext, uris: List[str]
+    ) -> None:
+        """Refuse a qualified resources mutation that overlaps scheduled processing.
+
+        Call only while ``_uri_mutation_coordinator.mutation`` covers ``uris``
+        and after the caller's own authorization checks. Every same-process
+        watch create, update, delete and executing tick holds a coordinator
+        access lease on its target, so the answer stays true until the caller
+        releases the mutation lease. This is a process-local gate: it qualifies
+        a single backend process per storage root only.
+
+        Refused: an active or paused watch (native or Connector) of the same
+        account whose target equals, contains or lies below any URI; a watch
+        without a target whose parent is unknown or overlaps; and an unfinished
+        ``add_resource`` Task of the same account whose target overlaps or is
+        unknown. The last rule covers ingestion that outlives a timed-out or
+        cancelled watch tick: ``TaskTracker.cancel`` only requests cancellation
+        and the Task stays ``cancelling`` until its work settles.
+
+        Never writes watch or Task state. The error names no watch, owner,
+        Task or source.
+        """
+        from openviking.resource.uri_mutation_coordinator import uri_matches_prefix
+        from openviking_cli.exceptions import ConflictError, FailedPreconditionError
+
+        targets = [uri.rstrip("/") for uri in uris if uri]
+
+        def overlaps(candidate: str) -> bool:
+            return any(
+                uri_matches_prefix(candidate, target) or uri_matches_prefix(target, candidate)
+                for target in targets
+            )
+
+        def refuse() -> ConflictError:
+            return ConflictError(
+                "Resource target is in use by scheduled or in-flight processing"
+            )
+
+        manager = self._get_watch_manager()
+        # No manager means the scheduler is disabled (or absent): no tick can run.
+        if manager is not None:
+            if not getattr(manager, "_initialized", False):
+                raise FailedPreconditionError("Watch state is not ready; retry later")
+            for task in await manager.get_all_tasks(ctx.account_id, ctx.user.user_id, "root"):
+                if task.account_id != ctx.account_id:
+                    continue
+                if task.to_uri is None:
+                    if task.parent_uri is None or overlaps(task.parent_uri):
+                        raise refuse()
+                    continue
+                if overlaps(task.to_uri):
+                    raise refuse()
+
+        try:
+            records = await get_task_tracker().list_tasks(
+                task_type="add_resource", account_id=ctx.account_id, limit=None
+            )
+        except Exception as exc:
+            raise FailedPreconditionError(
+                "In-flight processing state is unavailable; retry later"
+            ) from exc
+        for record in records:
+            if not record.is_active():
+                continue
+            if record.resource_id is None or overlaps(record.resource_id):
+                raise refuse()
 
     async def rm(
         self,
@@ -1124,6 +1212,13 @@ class FSService:
 
         async def run() -> Dict[str, Any]:
             async with self._uri_mutation_coordinator.mutation(ctx.account_id, uris):
+                # tree_replace repeats these checks under native coverage; they
+                # run here first so a watch conflict never precedes a denial.
+                await viking_fs._ensure_access(uris[0], ctx, action=AclAction.WRITE)
+                await viking_fs._ensure_access(uris[0], ctx, action=AclAction.MANAGE)
+                await viking_fs._ensure_access(uris[1], ctx, action=AclAction.MANAGE)
+                await viking_fs._ensure_access(uris[2], ctx, action=AclAction.WRITE)
+                await self._refuse_watched_resource_targets(ctx, uris)
                 return await tree_replace.replace_tree(
                     viking_fs,
                     target_uri=uris[0],
@@ -1152,6 +1247,11 @@ class FSService:
         )
         lease = None
         if qualified:
+            # Fast refusal before native coverage. The authoritative check runs
+            # again under the coordinator mutation in move().
+            await viking_fs._ensure_access(from_uri, ctx, action=AclAction.WRITE)
+            await viking_fs._ensure_access(to_uri, ctx, action=AclAction.WRITE)
+            await self._refuse_watched_resource_targets(ctx, [from_uri, to_uri])
             admitted = await viking_fs._capture_resource_identity(ctx)
             requests = [
                 {"path": viking_fs._uri_to_path(uri, ctx=ctx).rsplit("/", 1)[0], "kind": "tree"}
@@ -1182,8 +1282,12 @@ class FSService:
                 viking_fs._uri_to_path(to_uri, ctx=ctx), to_uri
             )
         watch_manager = self._get_watch_manager()
+        # The qualified path (coverage held) refuses watched targets instead of
+        # rewriting watch state, so it never writes the watch file.
+        qualified = coverage is not None
         use_watch_transaction = (
             watch_manager is not None
+            and not qualified
             and context_type_for_uri(from_uri) == "resource"
             and context_type_for_uri(to_uri) == "resource"
             and namespace_policy_for_uri(from_uri).processing_mode
@@ -1206,6 +1310,8 @@ class FSService:
 
         async def move() -> None:
             async with self._uri_mutation_coordinator.mutation(ctx.account_id, [from_uri, to_uri]):
+                if qualified:
+                    await self._refuse_watched_resource_targets(ctx, [from_uri, to_uri])
                 if use_watch_transaction:
                     await watch_manager.validate_target_prefix_rewrite_internal(
                         from_uri, to_uri, account_id=ctx.account_id
@@ -1894,15 +2000,34 @@ class FSService:
             defer_processing=defer_processing,
             processing_mode=processing_mode,
         )
-        if self.compile_versions is None or edit_source == "compile":
-            return await write()
-        return await self.compile_versions.record_operation(
-            [operation["uri"] for operation in operations],
-            ctx,
-            f"{edit_source}_revise",
-            {"batch": True},
-            write,
+
+        async def record() -> Dict[str, Any]:
+            if self.compile_versions is None or edit_source == "compile":
+                return await write()
+            return await self.compile_versions.record_operation(
+                [operation["uri"] for operation in operations],
+                ctx,
+                f"{edit_source}_revise",
+                {"batch": True},
+                write,
+            )
+
+        # Same qualification as ContentWriteCoordinator._batch_write: a shared
+        # resources root with at least one conditional operation. Other batches
+        # keep their existing behavior.
+        qualified = VikingFS._is_shared_resource_uri(root_uri) and any(
+            operation.get("expected_absent") or operation.get("expected_sha256") is not None
+            for operation in operations
         )
+        if not qualified:
+            return await record()
+        effect_uris = [root_uri, *(operation["uri"] for operation in operations)]
+        async with self._uri_mutation_coordinator.mutation(ctx.account_id, effect_uris):
+            # The coordinator repeats these checks under native coverage.
+            for operation in operations:
+                await viking_fs._ensure_access(operation["uri"], ctx, action=AclAction.WRITE)
+            await self._refuse_watched_resource_targets(ctx, effect_uris)
+            return await record()
 
     async def set_tags(
         self,
