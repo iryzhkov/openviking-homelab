@@ -9,8 +9,6 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from openviking_cli.exceptions import NotFoundError
-
 from openviking.concurrency import bounded_map
 from openviking.core.namespace import context_type_for_uri
 from openviking.server.error_mapping import is_not_found_error
@@ -29,6 +27,7 @@ from openviking.storage.resource_rnfv import (
     canonical_vector_records_by_level,
 )
 from openviking.utils.content_hash import content_md5
+from openviking_cli.exceptions import NotFoundError
 
 # Closed fresh-resource operation limits, not defaults for other RFV callers.
 RESOURCE_REINDEX_FORMAL_LIMIT = 128
@@ -58,10 +57,9 @@ def validate_resource_reindex_uri(viking_fs, uri, ctx, *, target=None, is_dir=Tr
 
 def validate_resource_reindex_plan(viking_fs, snapshot, plan, ctx):
     """Validate the entire original plan before capturing or dispatching any action."""
-    from openviking_cli.exceptions import ResourceExhaustedError
-
     from openviking.storage.index_action import IndexAction
     from openviking.storage.vector_ids import vector_record_id
+    from openviking_cli.exceptions import ResourceExhaustedError
 
     target = snapshot.request.target_uri
     is_dir = snapshot.formal.entries[""].is_dir

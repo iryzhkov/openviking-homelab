@@ -13,10 +13,6 @@ from datetime import datetime, timezone
 from functools import wraps
 from typing import Any, AsyncIterator, Awaitable, Callable, Container, Dict, List, Mapping, Optional
 
-from openviking_cli.exceptions import InvalidArgumentError, ResourceExhaustedError
-from openviking_cli.utils import get_logger
-from openviking_cli.utils.config.vectordb_config import DEFAULT_INDEX_NAME, VectorDBBackendConfig
-
 from openviking.core.namespace import (
     resolve_uri,
     uri_parts,
@@ -53,6 +49,9 @@ from openviking.utils.tags import (
 )
 from openviking.utils.time_decay import parse_duration_ms
 from openviking.utils.time_utils import get_current_timestamp
+from openviking_cli.exceptions import InvalidArgumentError, ResourceExhaustedError
+from openviking_cli.utils import get_logger
+from openviking_cli.utils.config.vectordb_config import DEFAULT_INDEX_NAME, VectorDBBackendConfig
 
 logger = get_logger(__name__)
 

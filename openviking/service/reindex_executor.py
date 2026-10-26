@@ -10,11 +10,6 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Optional
 
-from openviking_cli.exceptions import InvalidArgumentError, NotFoundError, OpenVikingError
-from openviking_cli.utils import VikingURI, get_logger
-from openviking_cli.utils.config import get_openviking_config
-from openviking_cli.utils.config.embedding_config import SUMMARY_TEXT_SOURCES
-
 from openviking.config.vlm import VLMResolver
 from openviking.core.context import (
     Context,
@@ -52,6 +47,10 @@ from openviking.utils.embedding_utils import (
     get_resource_content_type,
 )
 from openviking.utils.ingest_options import IngestOptions
+from openviking_cli.exceptions import InvalidArgumentError, NotFoundError, OpenVikingError
+from openviking_cli.utils import VikingURI, get_logger
+from openviking_cli.utils.config import get_openviking_config
+from openviking_cli.utils.config.embedding_config import SUMMARY_TEXT_SOURCES
 
 logger = get_logger(__name__)
 
