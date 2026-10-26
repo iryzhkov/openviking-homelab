@@ -335,6 +335,7 @@ async def remove_resource_only(
     _ctx: RequestContext = Depends(get_request_context),
 ):
     from openviking.service.resource_maintenance import validate_resource_target
+
     uri = validate_resource_target(request.uri)
     result = await get_service().fs.remove_resource_only(uri, ctx=_ctx, recursive=request.recursive)
     return Response(status="ok", result=result)
@@ -346,6 +347,7 @@ async def prune_resource_index(
     _ctx: RequestContext = Depends(get_request_context),
 ):
     from openviking.service.resource_maintenance import validate_resource_target
+
     uri = validate_resource_target(request.uri)
     result = await get_service().fs.prune_resource_index(uri, ctx=_ctx)
     return Response(status="ok", result=result)

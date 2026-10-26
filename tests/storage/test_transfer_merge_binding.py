@@ -11,8 +11,8 @@ import pytest_asyncio
 
 from openviking.pyagfs import get_binding_client
 from openviking.resource.watch_manager import WatchManager
-from openviking.server.identity import RequestContext, Role
 from openviking.server.api_keys.legacy import FileStore
+from openviking.server.identity import RequestContext, Role
 from openviking.storage.acl import AclAction, AclManager
 from openviking.storage.collection_schemas import CollectionSchemas
 from openviking.storage.vector_ids import vector_record_id
@@ -638,6 +638,7 @@ async def test_acl_failure_restores_only_moved_vectors_after_directory_merge(
     await seed_vector(backend, f"{source}/file.txt", "new")
     await seed_vector(backend, f"{target}/only.txt", "keep")
     monkeypatch.setattr(fs, "_ensure_access", AsyncMock())
+
     async def acl_enabled(_account_id):
         return True
 

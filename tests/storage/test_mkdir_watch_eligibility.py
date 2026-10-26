@@ -15,8 +15,14 @@ from tests.storage.test_watch_eligibility_gate import (
     _harness,
     _variants,
     _watch,
+)
+from tests.storage.test_watch_eligibility_gate import (
     binding_fs as binding_fs,
+)
+from tests.storage.test_watch_eligibility_gate import (
     enabled_tree as enabled_tree,
+)
+from tests.storage.test_watch_eligibility_gate import (
     indexed_fs as indexed_fs,
 )
 
@@ -76,9 +82,7 @@ async def test_mkdir_acl_denial_precedes_watch_disclosure(enabled_tree, monkeypa
     service, _, _, _, watch_bytes = await _harness(
         enabled_tree, monkeypatch, [_watch(ctx, directory)]
     )
-    outsider = RequestContext(
-        user=UserIdentifier(ctx.account_id, "outsider"), role=Role.USER
-    )
+    outsider = RequestContext(user=UserIdentifier(ctx.account_id, "outsider"), role=Role.USER)
     with pytest.raises(OpenVikingError) as error:
         await service.mkdir(directory, outsider)
     assert error.value.code == "PERMISSION_DENIED"
