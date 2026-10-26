@@ -154,6 +154,22 @@ def _with_metadata(entries, records, uri):
     )
 
 
+def _qualify_retained_context_records(source, target, records, retained, retained_paths):
+    """Refuse retained controls without an incoming path-and-level representation."""
+    incoming = {(record["uri"][len(source) :], record.get("level", 2)) for record in records}
+    for record in retained:
+        relative = record["uri"][len(target) :]
+        fields = _controls(record)
+        if relative in retained_paths and (relative, record.get("level", 2)) not in incoming:
+            if (
+                fields["search_tags"]
+                or fields.get("tags")
+                or fields["acl_direct_grants"]
+                or fields["acl_mode"] == "restricted"
+            ):
+                raise InvalidArgumentError("staging lacks an indexed retained metadata entry")
+
+
 async def _prepare_context_copy(
     viking_fs, source, target, records, ctx, *, retained=None, anchor=None
 ):
@@ -513,31 +529,21 @@ async def replace_tree(
                 target_uri=target_uri,
                 current_revisions=problems,
             )
-        # If staging lacks a tagged/direct-policy record at a retained entry,
-        # there is no qualified metadata-only record representation here.
-        incoming = {
-            (record["uri"][len(staging_uri) :], record.get("level", 2))
-            for record in staging_records
-        }
-        retained_paths = {
-            "",
-            *(
-                f"/{entry['path']}"
-                for entry in staging_entries or []
-                if entry["type"] in {"file", "dir"}
-            ),
-        }
-        for record in original_records:
-            relative = record["uri"][len(target_uri) :]
-            fields = _controls(record)
-            if relative in retained_paths and (relative, record.get("level", 2)) not in incoming:
-                if (
-                    fields["search_tags"]
-                    or fields.get("tags")
-                    or fields["acl_direct_grants"]
-                    or fields["acl_mode"] == "restricted"
-                ):
-                    raise InvalidArgumentError("staging lacks an indexed retained metadata entry")
+        # No metadata-only representation exists for omitted retained controls.
+        _qualify_retained_context_records(
+            staging_uri,
+            target_uri,
+            staging_records,
+            original_records,
+            {
+                "",
+                *(
+                    f"/{entry['path']}"
+                    for entry in staging_entries or []
+                    if entry["type"] in {"file", "dir"}
+                ),
+            },
+        )
         anchor = None
         if target_entries is not None and await viking_fs._acl_enabled(ctx):
             anchor = await viking_fs.acl_manager.resolve(target_uri, ctx)

@@ -1,7 +1,9 @@
 """Whole-import producer coverage with real native local files and vectors."""
 
 import asyncio
+import hashlib
 import json
+import zipfile
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -52,7 +54,7 @@ class Resolver:
 
 
 @pytest_asyncio.fixture
-async def pack(enabled_tree, tmp_path):  # noqa: F811
+async def pack(enabled_tree, tmp_path, request):  # noqa: F811
     fs, backend, ctx, target, *_ = enabled_tree
     source = "viking://resources/source/doc"
     await fs.write_file_bytes(source + "/one.md", b"incoming one", ctx=ctx)
@@ -87,6 +89,36 @@ async def pack(enabled_tree, tmp_path):  # noqa: F811
         vector_config_resolver=resolver,
         include_vectors=True,
     )
+
+    if not getattr(request, "param", True):
+        # Export requires full indexing; import accepts a complete dense snapshot
+        # of supplied rows with an unindexed physical child.
+        with zipfile.ZipFile(path) as archive:
+            entries = [(info, archive.read(info)) for info in archive.infolist()]
+        payloads = {info.filename: data for info, data in entries}
+        manifest_path = "doc/_ovpack/manifest.json"
+        records_path = "doc/_ovpack/index_records.jsonl"
+        dense_path = "doc/_ovpack/dense.f32"
+        manifest = json.loads(payloads[manifest_path])
+        records = [json.loads(line) for line in payloads[records_path].splitlines()]
+        records = [record for record in records if record["path"] != "one.md"]
+        assert len(records) == 2 and all(record["path"] == "" for record in records)
+        dense = bytearray()
+        for record in records:
+            ref = record["vector"]["dense"]
+            start = ref["offset"] * 4
+            ref["offset"] = len(dense) // 4
+            dense.extend(payloads[dense_path][start : start + ref["dimensions"] * 4])
+        payloads[records_path] = ("".join(json.dumps(row) + "\n" for row in records)).encode()
+        payloads[dense_path] = bytes(dense)
+        for kind, name in (("records", records_path), ("dense", dense_path)):
+            manifest["index"][kind].update(
+                count=len(records), sha256=hashlib.sha256(payloads[name]).hexdigest()
+            )
+        payloads[manifest_path] = json.dumps(manifest).encode()
+        with zipfile.ZipFile(path, "w") as archive:
+            for info, _ in entries:
+                archive.writestr(info, payloads[info.filename])
 
     async def run(**kwargs):
         return await import_ovpack(
@@ -272,6 +304,111 @@ async def test_metadata_and_direct_acl_are_retained(pack):
     result = (await backend.get([vector_record_id(ctx.account_id, target, 0)], ctx=ctx))[0]
     assert result["search_tags"] == ["owner=retained"]
     assert result["tags"] == "retained-tag"
+
+
+@pytest.mark.parametrize(
+    ("pack", "controls"),
+    [
+        (False, "restricted"),
+        (False, "tags"),
+        (False, "search_tags"),
+        (False, "direct"),
+        (False, "none"),
+        (True, "restricted"),
+    ],
+    indirect=["pack"],
+    ids=[
+        "missing-restricted",
+        "missing-tags",
+        "missing-search-tags",
+        "missing-direct",
+        "missing-uncontrolled",
+        "complete-restricted",
+    ],
+)
+async def test_retained_child_requires_representable_controls(pack, controls, monkeypatch, request):
+    from openviking.server.identity import RequestContext, Role
+    from openviking.storage.acl import AclMode
+    from openviking_cli.exceptions import PermissionDeniedError
+    from openviking_cli.session.user_id import UserIdentifier
+
+    fs, backend, ctx, target, run = pack
+    child = target + "/one.md"
+    child_id = vector_record_id(ctx.account_id, child, 2)
+    await backend.upsert(
+        {
+            "id": child_id,
+            "uri": child,
+            "level": 2,
+            "account_id": ctx.account_id,
+            "vector": [0.2] * 4,
+            "abstract": "old child",
+        },
+        ctx=ctx,
+    )
+    if controls in {"restricted", "direct"}:
+        await fs.set_acl(
+            child,
+            [{"principal": f"user:{ctx.user.user_id}", "level": "manage"}],
+            ctx=ctx,
+            acl_mode=AclMode.RESTRICTED if controls == "restricted" else AclMode.INHERIT,
+        )
+    record = (await backend.get([child_id], ctx=ctx))[0]
+    if controls in {"restricted", "tags"}:
+        record["tags"] = "retained-child"
+    if controls in {"restricted", "search_tags"}:
+        record["search_tags"] = ["owner=retained-child"]
+    await backend.upsert(record, ctx=ctx)
+    before = await backend.get([child_id], ctx=ctx)
+    acl_before = await fs.get_acl(child, ctx=ctx)
+    outsider = RequestContext(user=UserIdentifier(ctx.account_id, "outsider"), role=Role(Role.USER))
+    # The target root is public; the child's policy must remain the boundary.
+    assert await fs.read_file_bytes(target + "/.abstract.md", ctx=outsider)
+    if controls == "restricted":
+        with pytest.raises(PermissionDeniedError):
+            await fs.read_file_bytes(child, ctx=outsider)
+
+    effects = []
+
+    def observe(obj, name):
+        original = getattr(obj, name)
+
+        async def call(*args, **kwargs):
+            effects.append(name)
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(obj, name, call)
+
+    for name in ("write", "mkdir", "rm"):
+        observe(fs._async_agfs, name)
+    for name in ("upsert", "_delete_vector_transfer_ids"):
+        observe(backend, name)
+    observe(fs.acl_manager, "refresh_context_subtree")
+    # The fixture's compatible snapshot always contains indexed root sidecars.
+    # Only the child's incoming row varies; its physical bytes are always present.
+    from openviking.storage.ovpack import resource_import
+
+    observe(resource_import, "clear_skill_package_contents")
+    missing_controlled = controls != "none" and not request.node.callspec.params["pack"]
+    if missing_controlled:
+        with pytest.raises(InvalidArgumentError, match="indexed retained metadata"):
+            await run()
+        assert effects == []
+        assert await raw(fs, child, ctx) == b"old one"
+        assert await backend.get([child_id], ctx=ctx) == before
+        assert await fs.get_acl(child, ctx=ctx) == acl_before
+    else:
+        await run()
+        assert effects
+        assert await raw(fs, child, ctx) == b"incoming one"
+        if controls != "none":
+            after = (await backend.get([child_id], ctx=ctx))[0]
+            assert await fs.get_acl(child, ctx=ctx) == acl_before
+            assert after["tags"] == before[0]["tags"]
+            assert after["search_tags"] == before[0]["search_tags"]
+    if controls == "restricted":
+        with pytest.raises(PermissionDeniedError):
+            await fs.read_file_bytes(child, ctx=outsider)
 
 
 async def test_descendant_acl_denial_precedes_all_mutations(pack):

@@ -13,6 +13,7 @@ from openviking.service.tree_replace import (
     _context_records,
     _finish_context_copy,
     _prepare_context_copy,
+    _qualify_retained_context_records,
 )
 from openviking.storage.acl import AclAction
 from openviking.storage.ovpack.format import join_uri
@@ -167,6 +168,16 @@ async def import_resource_pack(
             ctx,
             retained=existing,
         )
+
+        # Include implicit parent directories as well as every physical member.
+        # Import may materialize these even when ZIP directory entries are absent.
+        retained_paths = {""}
+        for _, _, kind, relative in members:
+            if kind in {"manifest", "internal"}:
+                continue
+            parts = relative.split("/")
+            retained_paths.update("/" + "/".join(parts[:end]) for end in range(1, len(parts) + 1))
+        _qualify_retained_context_records(root_uri, root_uri, prepared, existing, retained_paths)
 
         async def mutate():
             await validate_owner()
