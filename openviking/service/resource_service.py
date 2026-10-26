@@ -156,6 +156,7 @@ _ADD_RESOURCE_ARGS_RESERVED_FIELDS = frozenset(
         "acl",
         "internal_task",
         "target_validator",
+        "resource_creation_identity",
     }
 )
 _ADD_RESOURCE_TRANSIENT_ARGS = frozenset({"tos_signature", "tos_access"})
@@ -178,6 +179,7 @@ _INTERNAL_INGESTION_FIELDS = frozenset(
         "resolved_extension",
         "prepared_resource",
         "target_validator",
+        "resource_creation_identity",
     }
 )
 
@@ -817,6 +819,45 @@ class ResourceService:
 
         return task
 
+    def _requires_resource_admission(
+        self, to: str = "", parent: str = "", *, ctx: RequestContext
+    ) -> bool:
+        # TreeBuilder uses explicit to/parent, otherwise its resources default.
+        # Classify through the same account-aware routing used by final storage.
+        target = to or parent
+        if not target:
+            return True
+        try:
+            path = self._viking_fs._uri_to_path(normalize_storage_target_uri(target), ctx=ctx)
+        except ValueError:
+            # Unknown targets cannot turn unresolved resource intent into an
+            # unbound request. Normal target validation still rejects them.
+            return True
+        root = self._viking_fs._uri_to_path("viking://resources", ctx=ctx)
+        return path.rstrip("/") == root.rstrip("/") or path.startswith(root.rstrip("/") + "/")
+
+    async def validate_add_resource_job(self, msg: Any, ctx: RequestContext, resource_lock=None):
+        """Validate original queued intent before consumer effects."""
+        from openviking.server.account_stores.models import AccountIdentity
+        from openviking.service.account_identity import recheck_account_identity
+
+        if not self._requires_resource_admission(msg.root_uri, ctx=ctx):
+            return None
+        creation = msg.resource_creation_identity
+        if type(creation) is not str or not creation.strip():
+            raise ConflictError("Queued resource job lacks original account admission")
+        admitted = AccountIdentity(creation, False)
+        if resource_lock is not None and (
+            await self._viking_fs._async_agfs.pathlock_refresh(resource_lock) != "refreshed"
+        ):
+            raise ConflictError("Queued resource ownership was lost")
+        await recheck_account_identity(
+            self._viking_fs._account_identity_manager, ctx.account_id, admitted
+        )
+        if msg.prepared is not None and msg.prepared.get("resource_creation_identity") != creation:
+            raise ConflictError("Prepared resource admission differs from queued admission")
+        return admitted
+
     async def execute_add_resource_job(
         self,
         msg: Any,
@@ -827,6 +868,7 @@ class ResourceService:
         task_auth: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Execute one durable add-resource job inside its QueueFS consumer."""
+        await self.validate_add_resource_job(msg, ctx, resource_lock)
         if msg.job_phase is AddResourcePhase.SOURCE:
             from openviking.resource.staged_source import StagedSource, materialize_source
 
@@ -959,12 +1001,14 @@ class ResourceService:
                         stage_callback=stage_callback,
                         watch_auth_state=watch_auth_state,
                         prepared_resource=prepared_resource,
+                        resource_creation_identity=msg.resource_creation_identity,
                         internal_task=msg.internal_task,
                         on_watch_ready=lambda task_id: setattr(msg, "watch_task_id", task_id),
                         **internal_kwargs,
                     )
             except BaseException:
                 if msg.cleanup_empty_target_on_failure and resource_lock is not None:
+                    await self.validate_add_resource_job(msg, ctx, resource_lock)
                     await self._cleanup_reserved_target_if_empty(
                         root_uri=msg.root_uri,
                         ctx=ctx,
@@ -976,6 +1020,7 @@ class ResourceService:
                 and msg.cleanup_empty_target_on_failure
                 and resource_lock is not None
             ):
+                await self.validate_add_resource_job(msg, ctx, resource_lock)
                 await self._cleanup_reserved_target_if_empty(
                     root_uri=msg.root_uri,
                     ctx=ctx,
@@ -1332,6 +1377,7 @@ class ResourceService:
         enforce_public_remote_targets: bool,
         processor_kwargs: Dict[str, Any],
         internal_task: bool,
+        resource_creation_identity: Optional[str] = None,
         is_active: Optional[bool] = None,
     ) -> Dict[str, Any]:
         from openviking.storage.queuefs.add_resource_msg import AddResourceMsg
@@ -1346,7 +1392,13 @@ class ResourceService:
         resource_lock = None
         defer_target_resolution = False
         staged_enqueued = False
+        admission = SimpleNamespace(
+            root_uri=to or parent or "viking://resources",
+            resource_creation_identity=resource_creation_identity,
+            prepared=None,
+        )
         try:
+            await self.validate_add_resource_job(admission, ctx)
             (
                 root_uri,
                 resource_lock,
@@ -1362,6 +1414,8 @@ class ResourceService:
                 defer_candidate_resolution=defer_candidate_resolution,
                 to_is_directory=planned_to_is_directory,
             )
+            admission.root_uri = root_uri
+            await self.validate_add_resource_job(admission, ctx, resource_lock)
             lock_handoff = await self._lock_to_handoff_payload(resource_lock)
             message_path = plan.path
             if processor_kwargs.get("temp_file_id") and plan.understanding_file_id is not None:
@@ -1373,6 +1427,7 @@ class ResourceService:
             msg = AddResourceMsg(
                 task_id=str(uuid4()),
                 job_phase=AddResourcePhase.SOURCE,
+                resource_creation_identity=resource_creation_identity,
                 path=message_path,
                 source_path=(plan.source_identity.source_name or "")
                 if processor_kwargs.get("temp_file_id")
@@ -1446,6 +1501,7 @@ class ResourceService:
 
             async def cleanup_enqueue_failure(lock: Dict[str, Any]) -> None:
                 if cleanup_empty_target_on_failure:
+                    await self.validate_add_resource_job(msg, ctx, lock)
                     await self._cleanup_reserved_target_if_empty(
                         root_uri=root_uri,
                         ctx=ctx,
@@ -1464,6 +1520,7 @@ class ResourceService:
             if resource_lock is not None:
                 await self._release_lock_ref(resource_lock)
             if plan.staged_source is not None and not staged_enqueued:
+                await self.validate_add_resource_job(admission, ctx)
                 await self._viking_fs.delete_temp(plan.staged_source.temp_uri, ctx=ctx)
             raise
 
@@ -1638,12 +1695,17 @@ class ResourceService:
         **kwargs,
     ) -> Dict[str, Any]:
         """Accept and route a new resource-add request."""
+        self._ensure_initialized()
         internal_fields = sorted(set(kwargs).intersection(_INTERNAL_INGESTION_FIELDS))
         if internal_fields:
             raise InvalidArgumentError(
                 "add_resource does not accept internal execution fields: "
                 + ", ".join(internal_fields)
             )
+        resource_creation_identity = None
+        if self._requires_resource_admission(to or "", parent or "", ctx=ctx):
+            admitted = await self._viking_fs._capture_resource_identity(ctx)
+            resource_creation_identity = admitted.creation_identity
         if isinstance(add_type, str):
             add_type = add_type.strip() or None
         return await self._submit_resource_ingestion(
@@ -1669,6 +1731,7 @@ class ResourceService:
             internal_task=internal_task,
             args=args,
             shared_source=shared_source,
+            resource_creation_identity=resource_creation_identity,
             **kwargs,
         )
 
@@ -1693,6 +1756,10 @@ class ResourceService:
         **kwargs,
     ) -> Dict[str, Any]:
         """Submit a scheduled refresh without changing its watch task."""
+        if self._requires_resource_admission(to or "", parent or "", ctx=ctx):
+            raise ConflictError(
+                "Automatic resource refresh lacks original WatchTask account admission"
+            )
         return await self._submit_resource_ingestion(
             path=path,
             ctx=ctx,
@@ -1742,6 +1809,7 @@ class ResourceService:
         connector_states: Optional[Dict[str, Any]] = None,
         shared_source: Optional["SharedSource"] = None,
         acl: AclSpec | dict[str, Any] | None = None,
+        resource_creation_identity: Optional[str] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """Validate and route one resource ingestion request.
@@ -2058,6 +2126,23 @@ class ResourceService:
                 result["watch_id"] = watch_task_id
             return result
 
+        # Recheck the identity captured at fresh add_resource admission.
+        # Connector submission above is a separate producer contract.
+        if self._requires_resource_admission(target_to, target_parent, ctx=ctx):
+            from openviking.server.account_stores.models import AccountIdentity
+            from openviking.service.account_identity import recheck_account_identity
+
+            if (
+                type(resource_creation_identity) is not str
+                or not resource_creation_identity.strip()
+            ):
+                raise ConflictError("Native resource request lacks original account admission")
+            await recheck_account_identity(
+                self._viking_fs._account_identity_manager,
+                ctx.account_id,
+                AccountIdentity(resource_creation_identity, False),
+            )
+
         from openviking.parse.accessors.feishu_accessor import FeishuAccessor
 
         if is_active is False and not (
@@ -2106,6 +2191,7 @@ class ResourceService:
                 enforce_public_remote_targets=enforce_public_remote_targets,
                 processor_kwargs=kwargs,
                 internal_task=internal_task,
+                resource_creation_identity=resource_creation_identity,
                 is_active=is_active,
             )
         else:
@@ -2131,6 +2217,7 @@ class ResourceService:
                 enforce_public_remote_targets=enforce_public_remote_targets,
                 watch_auth_state=normalized_args.watch_auth_state,
                 internal_task=internal_task,
+                resource_creation_identity=resource_creation_identity,
                 acl=acl,
                 **kwargs,
             )
@@ -2192,6 +2279,7 @@ class ResourceService:
         resource_lock: Optional[Dict[str, Any]] = None,
         stage_callback: Optional[Callable[[str], Any]] = None,
         prepared_resource: Optional["LocalResource"] = None,
+        resource_creation_identity: Optional[str] = None,
         internal_task: bool = False,
         on_watch_ready: Optional[Callable[[str], None]] = None,
         acl: AclSpec | dict[str, Any] | None = None,
@@ -2246,6 +2334,7 @@ class ResourceService:
                 stage_callback=stage_callback,
                 allow_local_path_resolution=allow_local_path_resolution,
                 prepared_resource=prepared_resource,
+                resource_creation_identity=resource_creation_identity,
                 target_validator=self._ensure_resource_target_available,
                 defer_post_processing=True,
                 tags=tags,
@@ -2295,6 +2384,7 @@ class ResourceService:
                 msg = AddResourceMsg(
                     task_id=str(uuid4()),
                     job_phase=AddResourcePhase.POST_PROCESS,
+                    resource_creation_identity=prepared.get("resource_creation_identity"),
                     root_uri=root_uri,
                     prepared=prepared,
                     source_path=str(

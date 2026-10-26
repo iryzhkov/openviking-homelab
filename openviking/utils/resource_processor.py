@@ -793,6 +793,7 @@ class ResourceProcessor:
         tag_mode: str = "replace",
         acl: AclSpec | Dict[str, Any] | None = None,
         target_validator: Optional[Callable[[str, RequestContext], Awaitable[None]]] = None,
+        resource_creation_identity: Optional[str] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -815,11 +816,27 @@ class ResourceProcessor:
         }
         from openviking.storage.queuefs.resource_embedding_fence import _resource_uri
 
-        resource_admitted = (
-            await get_viking_fs()._capture_resource_identity(ctx)
-            if scope == "resources" and _resource_uri(to or parent or "viking://resources")
-            else None
-        )
+        resource_admitted = None
+        if scope == "resources" and _resource_uri(to or parent or "viking://resources"):
+            if resource_creation_identity is None:
+                # Direct callers enter at their own fresh admission boundary.
+                # ResourceService rejects unbound queued jobs before reaching here.
+                resource_admitted = await get_viking_fs()._capture_resource_identity(ctx)
+            else:
+                from openviking.server.account_stores.models import AccountIdentity
+                from openviking.service.account_identity import recheck_account_identity
+
+                if (
+                    type(resource_creation_identity) is not str
+                    or not resource_creation_identity.strip()
+                ):
+                    raise ValueError(
+                        "Original resource account admission must be a non-empty string"
+                    )
+                resource_admitted = AccountIdentity(resource_creation_identity, False)
+                await recheck_account_identity(
+                    get_viking_fs()._account_identity_manager, ctx.account_id, resource_admitted
+                )
         defer_post_processing = bool(kwargs.pop("defer_post_processing", False))
         preacquired_lock = kwargs.pop("resource_lock", None)
         ingest_options = IngestOptions.from_search_tags(tags, mode=tag_mode)

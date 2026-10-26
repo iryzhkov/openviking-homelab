@@ -69,6 +69,7 @@ class AddResourceProcessor(DequeueHandlerBase):
             return
         from openviking.resource.staged_source import StagedSource
 
+        await self._resource_service.validate_add_resource_job(msg, ctx)
         staged = StagedSource.from_dict(msg.staged_source)
         await self._viking_fs.delete_temp(staged.temp_uri, ctx=ctx)
 
@@ -77,6 +78,7 @@ class AddResourceProcessor(DequeueHandlerBase):
             return
         from openviking.parse.output import ParseArtifactRef, store_for_artifact_ref
 
+        await self._resource_service.validate_add_resource_job(msg, ctx)
         artifact_ref = ParseArtifactRef.from_dict(msg.prepared["artifact_ref"])
         store = store_for_artifact_ref(artifact_ref, viking_fs=self._viking_fs, ctx=ctx)
         await store.cleanup(artifact_ref)
@@ -86,11 +88,15 @@ class AddResourceProcessor(DequeueHandlerBase):
         msg: AddResourceMsg,
         ctx: RequestContext,
     ) -> None:
+        await self._resource_service.validate_add_resource_job(msg, ctx)
         if msg.lock_handoff is not None:
             lock_guard = PathLockGuard(self._viking_fs._async_agfs)
             try:
                 await lock_guard.adopt(msg.lock_handoff)
                 if msg.cleanup_empty_target_on_failure:
+                    await self._resource_service.validate_add_resource_job(
+                        msg, ctx, lock_guard.lease
+                    )
                     await self._resource_service._cleanup_reserved_target_if_empty(
                         root_uri=msg.root_uri,
                         ctx=ctx,
@@ -156,6 +162,12 @@ class AddResourceProcessor(DequeueHandlerBase):
             actor_peer_id=msg.actor_peer_id,
             bypass_acl=msg.bypass_acl,
         )
+        # A cached job must never acquire fresh authority, materialize a target,
+        # clean up another lifetime's paths, or create its business task here.
+        try:
+            await self._resource_service.validate_add_resource_job(msg, ctx)
+        except Exception as exc:
+            return ProcessResult.failed(str(exc))
         tracker = get_task_tracker()
         task = await tracker.create(
             "add_resource",
