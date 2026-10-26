@@ -1,8 +1,8 @@
 //! PathLockWrappedFS — automatic lock acquisition for simple file operations.
 //!
 //! This wrapper sits between `StatsWrappedFS` and `MountableFS` in the stack.
-//! It auto-acquires locks for `create`, `write`, `truncate`, `remove`, `remove_all`,
-//! `rename`, and `replace`, then delegates to the inner filesystem.
+//! It auto-acquires locks for `create`, `mkdir`, `ensure_parent_dirs`, `write`,
+//! `truncate`, `remove`, `remove_all`, `rename`, and `replace`, then delegates to the inner filesystem.
 //!
 //! It is NOT a lock protocol implementation — all lock logic is delegated to
 //! `PathLockManager`.
@@ -138,7 +138,26 @@ impl FileSystem for PathLockWrappedFS {
     }
 
     async fn mkdir(&self, path: &str, mode: u32) -> crate::core::Result<()> {
-        self.inner.mkdir(path, mode).await
+        // EncryptionWrappedFS forwards directory creation without locking.
+        if Self::should_bypass_auto_lock(path) {
+            return self.inner.mkdir(path, mode).await;
+        }
+        let requests = [PathLockRequest {
+            path: path.to_string(),
+            kind: PathLockKind::Exact,
+        }];
+        if self.should_skip_auto_lock(&requests).await? {
+            return self.inner.mkdir(path, mode).await;
+        }
+        // Exact on a missing path uses a parent sidecar: it does not create
+        // the requested directory, preserving exclusive mkdir semantics.
+        let lease = self
+            .manager
+            .acquire_exact(path, self.manager.default_lock_timeout(), None)
+            .await?;
+        let result = self.inner.mkdir(path, mode).await;
+        let release = self.manager.release(&lease).await;
+        Self::merge_operation_and_release(result, release)
     }
 
     async fn remove(&self, path: &str) -> crate::core::Result<()> {
@@ -391,7 +410,38 @@ impl FileSystem for PathLockWrappedFS {
     }
 
     async fn ensure_parent_dirs(&self, path: &str, mode: u32) -> crate::core::Result<()> {
-        self.inner.ensure_parent_dirs(path, mode).await
+        if Self::should_bypass_auto_lock(path) {
+            return self.inner.ensure_parent_dirs(path, mode).await;
+        }
+        if path == "/" || !path.contains('/') {
+            return self.inner.ensure_parent_dirs(path, mode).await;
+        }
+        let trimmed = path.trim_end_matches('/');
+        let parent = match trimmed.rsplit_once('/') {
+            Some(("", _)) | None => "/",
+            Some((parent, _)) => parent,
+        };
+        // No mutation is needed when the parent already exists. Return here;
+        // delegating create_dir_all could recreate a parent removed after stat.
+        if matches!(self.inner.stat(parent).await, Ok(info) if info.is_dir) {
+            return Ok(());
+        }
+        let requests = [PathLockRequest {
+            path: parent.to_string(),
+            kind: PathLockKind::Exact,
+        }];
+        if self.should_skip_auto_lock(&requests).await? {
+            return self.inner.ensure_parent_dirs(path, mode).await;
+        }
+        // The manager checks ancestor Tree tokens for this deepest directory
+        // before creating lock parents through the inner filesystem.
+        let lease = self
+            .manager
+            .acquire_exact(parent, self.manager.default_lock_timeout(), None)
+            .await?;
+        let result = self.inner.ensure_parent_dirs(path, mode).await;
+        let release = self.manager.release(&lease).await;
+        Self::merge_operation_and_release(result, release)
     }
 }
 
@@ -403,13 +453,17 @@ mod tests {
     use crate::lock::provider::MemoryPathLockProvider;
     use crate::plugins::memfs::MemFileSystem;
 
-    /// Missing at stat time; any subsequent mutation would be a bug.
-    struct MissingFS;
+    /// Configurable stat result; any subsequent mutation would be a bug.
+    struct NoMutationFS {
+        existing: Option<FileInfo>,
+    }
 
     #[async_trait]
-    impl FileSystem for MissingFS {
+    impl FileSystem for NoMutationFS {
         async fn stat(&self, path: &str) -> crate::core::Result<FileInfo> {
-            Err(Error::NotFound(path.to_string()))
+            self.existing
+                .clone()
+                .ok_or_else(|| Error::NotFound(path.to_string()))
         }
 
         async fn remove(&self, _path: &str) -> crate::core::Result<()> {
@@ -469,7 +523,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_deletes_return_without_delegating() {
-        let fs: Arc<dyn FileSystem> = Arc::new(MissingFS);
+        let fs: Arc<dyn FileSystem> = Arc::new(NoMutationFS { existing: None });
         let manager = Arc::new(PathLockManager::new(
             fs.clone(),
             Arc::new(MemoryPathLockProvider::new()),
@@ -498,6 +552,141 @@ mod tests {
             PathLockWrappedFS::new(manager, fs.clone() as Arc<dyn FileSystem>),
             fs,
         )
+    }
+
+    #[tokio::test]
+    async fn mkdir_refuses_foreign_ancestor_tree_without_creating_target() {
+        let (wrapped, fs) = wrapped().await;
+        let foreign = wrapped
+            .manager
+            .acquire_tree("/data", std::time::Duration::ZERO, None)
+            .await
+            .unwrap();
+        assert!(wrapped.mkdir("/data/new", 0o755).await.is_err());
+        assert!(matches!(
+            fs.stat("/data/new").await,
+            Err(Error::NotFound(_))
+        ));
+        wrapped.manager.release(&foreign).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn directory_creation_uses_own_covering_lease() {
+        use crate::core::context::{FsContextInner, PathLockContext, FS_CTX};
+
+        let (wrapped, fs) = wrapped().await;
+        let lease = wrapped
+            .manager
+            .acquire_tree("/data", std::time::Duration::ZERO, None)
+            .await
+            .unwrap();
+        let ctx = Arc::new(FsContextInner::with_pathlock(
+            "tenant",
+            PathLockContext {
+                lease_ref: Some(lease.lease.lease_ref.clone()),
+                disable_auto_pathlock: false,
+            },
+        ));
+        FS_CTX
+            .scope(ctx, async {
+                wrapped.mkdir("/data/new", 0o755).await.unwrap();
+                wrapped
+                    .ensure_parent_dirs("/data/a/b/file", 0o755)
+                    .await
+                    .unwrap();
+            })
+            .await;
+        assert!(fs.stat("/data/new").await.unwrap().is_dir);
+        assert!(fs.stat("/data/a/b").await.unwrap().is_dir);
+        wrapped.manager.release(&lease).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_parents_fast_path_never_delegates_directory_creation() {
+        let (_, memfs) = wrapped().await;
+        let fs: Arc<dyn FileSystem> = Arc::new(NoMutationFS {
+            existing: Some(memfs.stat("/data").await.unwrap()),
+        });
+        let manager = Arc::new(PathLockManager::new(
+            fs.clone(),
+            Arc::new(MemoryPathLockProvider::new()),
+            PathLockConfig::default(),
+        ));
+        let wrapped = PathLockWrappedFS::new(manager, fs);
+        wrapped
+            .ensure_parent_dirs("/data/file", 0o755)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_parents_existing_fast_path_needs_no_lease() {
+        let (wrapped, _) = wrapped().await;
+        let foreign = wrapped
+            .manager
+            .acquire_tree("/data", std::time::Duration::ZERO, None)
+            .await
+            .unwrap();
+        wrapped
+            .ensure_parent_dirs("/data/file", 0o755)
+            .await
+            .unwrap();
+        wrapped.manager.release(&foreign).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_multilevel_parents_refuses_foreign_ancestor_tree() {
+        let (wrapped, fs) = wrapped().await;
+        let foreign = wrapped
+            .manager
+            .acquire_tree("/data", std::time::Duration::ZERO, None)
+            .await
+            .unwrap();
+        assert!(wrapped
+            .ensure_parent_dirs("/data/a/b/file", 0o755)
+            .await
+            .is_err());
+        assert!(matches!(fs.stat("/data/a").await, Err(Error::NotFound(_))));
+        wrapped.manager.release(&foreign).await.unwrap();
+        wrapped
+            .ensure_parent_dirs("/data/a/b/file", 0o755)
+            .await
+            .unwrap();
+        assert!(fs.stat("/data/a/b").await.unwrap().is_dir);
+    }
+
+    #[tokio::test]
+    async fn mkdir_keeps_exclusive_creation() {
+        let (wrapped, _) = wrapped().await;
+        wrapped.mkdir("/data/new", 0o755).await.unwrap();
+        assert!(matches!(
+            wrapped.mkdir("/data/new", 0o755).await,
+            Err(Error::AlreadyExists(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn directory_control_paths_bypass_auto_lock() {
+        let (wrapped, fs) = wrapped().await;
+        fs.mkdir("/queue", 0o755).await.unwrap();
+        let foreign = wrapped
+            .manager
+            .acquire_tree("/queue", std::time::Duration::ZERO, None)
+            .await
+            .unwrap();
+        wrapped.mkdir("/queue/new", 0o755).await.unwrap();
+        wrapped
+            .ensure_parent_dirs("/queue/a/b/file", 0o755)
+            .await
+            .unwrap();
+        wrapped.manager.release(&foreign).await.unwrap();
+        let foreign = wrapped
+            .manager
+            .acquire_tree("/data", std::time::Duration::ZERO, None)
+            .await
+            .unwrap();
+        wrapped.mkdir("/data/.path.ovlock", 0o755).await.unwrap();
+        wrapped.manager.release(&foreign).await.unwrap();
     }
 
     #[tokio::test]

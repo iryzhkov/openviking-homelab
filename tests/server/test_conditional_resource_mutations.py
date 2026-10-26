@@ -392,6 +392,51 @@ async def test_mv_no_replace_and_create_only_write_race_has_one_winner(client_wi
         assert await _read(client, source) == "moved body"
 
 
+@pytest.mark.parametrize("source_kind", ["file", "directory", "missing"])
+async def test_mv_rechecks_source_type_under_final_lease(
+    client_with_resource, service, monkeypatch, source_kind
+):
+    client, root = client_with_resource
+    source, target = f"{root}/type-race-source", f"{root}/type-race-target"
+    original_is_dir = source_kind == "directory"
+    await _seed(client, root, {
+        f"{source}/child.md" if original_is_dir else source: "original",
+    })
+    viking_fs = service.viking_fs
+    agfs = viking_fs._async_agfs
+    source_path = viking_fs._uri_to_path(source, ctx=_root_ctx())
+    original = agfs.pathlock_acquire_batch
+    raced = False
+
+    async def acquire_after_source_change(requests, *args, **kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            await agfs.rm(source_path, recursive=original_is_dir)
+            if source_kind == "file":
+                await agfs.mkdir(source_path)
+            elif source_kind == "directory":
+                await agfs.write(source_path, b"competing file")
+        return await original(requests, *args, **kwargs)
+
+    monkeypatch.setattr(agfs, "pathlock_acquire_batch", acquire_after_source_change)
+    with pytest.raises(ConflictError):
+        await viking_fs.mv(source, target, ctx=_root_ctx(), vector_mode="none")
+    assert raced
+    if source_kind == "directory":
+        assert await _read(client, source) == "competing file"
+    elif source_kind == "file":
+        assert await _tree(client, source) == []
+    else:
+        assert await _read(client, source) is None
+    if original_is_dir:
+        # Existing Tree acquisition can leave an empty destination. This is
+        # still an occupied directory, never evidence of absence or ownership.
+        assert await _tree(client, target) in (None, [])
+    else:
+        assert await _read(client, target) is None
+
+
 # -- fs/replace-tree -----------------------------------------------------------
 
 

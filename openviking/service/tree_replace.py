@@ -51,6 +51,8 @@ from openviking_cli.utils import get_logger
 logger = get_logger(__name__)
 
 ABSENT_REVISION = "absent"
+# A failed observation must never be used as evidence of absence or safe cleanup.
+_UNREADABLE_TREE = object()
 REVISION_PREFIX = "tree-sha256:"
 # Bound the work done while all three trees are locked.
 MAX_TREE_ENTRIES = 20_000
@@ -383,7 +385,7 @@ async def _recover(
     paths: tuple[str, str, str],
     ctx: RequestContext,
     lease: Dict[str, Any],
-    fs_ctx: Dict[str, Any],
+    fs_ctx: Dict[str, Any] | None,
 ) -> None:
     """Restore the old tree from the verified backup, never deleting a copy blindly."""
     target_path, staging_path, backup_path = paths
@@ -398,8 +400,11 @@ async def _recover(
         "target_uri": target_uri,
         "failure": type(failure).__name__,
     }
-    current = revision_of(await _safe_read(read, target_path))
-    if current == previous or (
+    current = _reported_revision(await _safe_read(read, target_path))
+    if current == "unknown":
+        details["state"] = "rollback_unavailable"
+        details["observation_failure"] = "target_unreadable"
+    elif current == previous or (
         previous == ABSENT_REVISION and current in (ABSENT_REVISION, revision_of([]))
     ):
         # The target files were never changed; any backup is only a copy. The
@@ -407,7 +412,9 @@ async def _recover(
         details["state"] = "target_unchanged"
         backup_entries = await _safe_read(read, backup_path)
         try:
-            if backup_entries:
+            if backup_entries is _UNREADABLE_TREE:
+                details["index_restore_failure"] = "backup_unreadable"
+            elif backup_entries:
                 await viking_fs._update_vector_store_uris(
                     backup_uri, target_uri, recursive=True, ctx=ctx
                 )
@@ -445,10 +452,10 @@ async def _recover(
     retained = []
     for uri, path in ((backup_uri, backup_path), (staging_uri, staging_path)):
         entries = await _safe_read(read, path)
-        if entries:
-            retained.append({"uri": uri, "revision": revision_of(entries)})
+        if entries is not None:
+            retained.append({"uri": uri, "revision": _reported_revision(entries)})
     details["retained"] = retained
-    details["target_revision"] = revision_of(await _safe_read(read, target_path))
+    details["target_revision"] = _reported_revision(await _safe_read(read, target_path))
     # File content is restored from copies; index records may need the native reindex.
     details["index_status"] = "reindex_recommended"
     code = "INTERNAL" if details["state"] in ("rolled_back", "target_unchanged") else "DATA_LOSS"
@@ -463,4 +470,8 @@ async def _safe_read(read, path):
     try:
         return await read(path)
     except Exception:
-        return None
+        return _UNREADABLE_TREE
+
+
+def _reported_revision(entries):
+    return "unknown" if entries is _UNREADABLE_TREE else revision_of(entries)

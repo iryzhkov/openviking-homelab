@@ -16,6 +16,7 @@ from openviking.core.namespace import (
     uri_parts,
 )
 from openviking.pyagfs.exceptions import (
+    AGFSAlreadyExistsError,
     AGFSClientError,
     AGFSDirectoryNotEmptyError,
     AGFSHTTPError,
@@ -28,6 +29,7 @@ from openviking.storage.abstract_overview import (
     rewrite_abstract_overview_for_transfer,
 )
 from openviking.storage.acl import AclAction, is_acl_uri
+from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
 from openviking.storage.expr import And, PathScope, RawDSL
 from openviking.storage.internal_names import is_storage_internal_name
 from openviking.storage.vector_ids import is_vector_record_id, vector_record_id
@@ -838,6 +840,22 @@ class _OpsMixin:
 
         operation_id = uuid.uuid4().hex
         try:
+            # Source classification before acquisition selected the lock kind.
+            # Refuse a missing or changed source before copying/index mutation.
+            try:
+                locked_stat = await self._async_agfs.stat(old_path)
+            except Exception as exc:
+                if is_not_found_error(exc):
+                    raise ConflictError(
+                        f"Move source disappeared during acquisition: {old_uri}",
+                        resource=old_uri,
+                    ) from exc
+                raise
+            if bool(locked_stat.get("isDir", False)) != bool(is_dir):
+                raise ConflictError(
+                    f"Move source type changed during acquisition: {old_uri}",
+                    resource=old_uri,
+                )
             if no_replace:
                 await self._ensure_transfer_destination_absent(
                     new_path, new_uri, allow_lock_placeholder=is_dir
@@ -2004,6 +2022,8 @@ class _OpsMixin:
                 path,
                 fs_ctx=self._pathlock_fs_ctx(ctx, lease_ref),
             )
+        except (LockAcquisitionError, ResourceBusyError):
+            raise
         except Exception as e:
             logger.debug(f"Failed to ensure parent directories for {path}: {e}")
             parent = path.rstrip("/").rsplit("/", 1)[0]
@@ -2025,11 +2045,14 @@ class _OpsMixin:
                     current,
                     fs_ctx=self._pathlock_fs_ctx(ctx, lease_ref),
                 )
+            except (AGFSAlreadyExistsError, FileExistsError):
+                continue
+            except (LockAcquisitionError, ResourceBusyError):
+                raise
             except Exception as e:
-                message = str(e).lower()
-                if "exist" in message or "already" in message:
+                if "already exists" in str(e).lower():
                     continue
-                logger.debug(f"Failed to create parent directory {current}: {e}")
+                raise
 
     # ========== Batch Read (backward compatible) ==========
 
