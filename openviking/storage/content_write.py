@@ -743,7 +743,8 @@ class ContentWriteCoordinator:
                 uri = operation["uri"]
                 stat = await self._safe_stat(uri, ctx=ctx, allow_not_found=True)
                 exists = not stat.get("not_found")
-                if exists and stat.get("isDir") and not skip_conflicts:
+                expected_absent = bool(operation.get("expected_absent"))
+                if exists and stat.get("isDir") and not skip_conflicts and not expected_absent:
                     raise InvalidArgumentError(f"batch-write target must be a file: {uri}")
 
                 requested_mode = operation["mode"]
@@ -759,6 +760,11 @@ class ContentWriteCoordinator:
                             f"cannot create generated abstract overview directly: {uri}"
                         )
                 try:
+                    # Checked under this batch's exact lease and before any operation
+                    # writes, so a conflict leaves every target untouched. An exact
+                    # lock never materializes its own target, so existence is real.
+                    if expected_absent and exists:
+                        raise ConflictError(f"Expected absent target exists: {uri}", resource=uri)
                     if exists and stat.get("isDir"):
                         raise ConflictError(f"Target is a directory: {uri}")
                     expected = operation.get("expected_sha256")
@@ -1100,6 +1106,13 @@ class ContentWriteCoordinator:
                 or any(c not in "0123456789abcdef" for c in expected)
             ):
                 raise InvalidArgumentError("expected_sha256 must be a lowercase SHA-256 digest")
+            expected_absent = raw.get("expected_absent", False)
+            if not isinstance(expected_absent, bool):
+                raise InvalidArgumentError(f"batch-write expected_absent must be a boolean: {uri}")
+            if expected_absent and expected is not None:
+                raise InvalidArgumentError(
+                    f"batch-write expected_absent and expected_sha256 are mutually exclusive: {uri}"
+                )
             self._validate_batch_mode(mode)
             if has_content_base64 and mode == "append":
                 raise InvalidArgumentError(
@@ -1132,6 +1145,7 @@ class ContentWriteCoordinator:
                     "content": content,
                     "mode": mode,
                     "expected_sha256": raw.get("expected_sha256"),
+                    "expected_absent": expected_absent,
                     "ingest_options": ingest_options,
                 }
             )

@@ -345,6 +345,10 @@ class MvRequest(BaseModel):
 
     from_uri: str
     to_uri: str
+    # Refuse with 409 when the destination exists as a file or a directory. Checked again
+    # under the move's source and destination locks before any copy or delete. The
+    # default keeps the existing behavior: a file is overwritten and a directory merged.
+    no_replace: bool = False
 
 
 class CpRequest(BaseModel):
@@ -410,7 +414,9 @@ async def mv(
         resolve_path_variables(request.to_uri), _ctx, field_name="to_uri"
     )
     try:
-        await service.fs.mv(from_uri, to_uri, ctx=_ctx)
+        # Pass the option only when set, so the default call shape stays unchanged.
+        options = {"no_replace": True} if request.no_replace else {}
+        await service.fs.mv(from_uri, to_uri, ctx=_ctx, **options)
     except AGFSNotFoundError:
         raise NotFoundError(from_uri, "file")
     except AGFSClientError as e:
@@ -423,4 +429,7 @@ async def mv(
         if mapped is not None:
             raise mapped from exc
         raise
-    return Response(status="ok", result={"from": from_uri, "to": to_uri})
+    result: dict[str, object] = {"from": from_uri, "to": to_uri}
+    if request.no_replace:
+        result["no_replace"] = True
+    return Response(status="ok", result=result)

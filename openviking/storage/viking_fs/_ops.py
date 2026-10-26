@@ -40,6 +40,7 @@ from openviking.storage.viking_fs._base import (
 )
 from openviking.utils.time_utils import format_iso8601, parse_iso_datetime
 from openviking_cli.exceptions import (
+    ConflictError,
     InvalidArgumentError,
     NotFoundError,
     PermissionDeniedError,
@@ -532,6 +533,41 @@ class _OpsMixin:
         if bool(stat.get("isDir", False)) != is_dir:
             raise InvalidArgumentError(f"transfer source and target types differ: {uri}")
 
+    async def _ensure_transfer_destination_absent(
+        self,
+        path: str,
+        uri: str,
+        *,
+        allow_lock_placeholder: bool = False,
+    ) -> None:
+        """Raise ``ConflictError`` unless no file or directory exists at ``path``.
+
+        ``allow_lock_placeholder`` is for the recheck under a Tree lease: with the
+        filesystem lock provider, acquiring a Tree lock on a missing path creates
+        that directory to hold ``.path.ovlock``. Such a directory has no visible
+        entries. Callers pass it only after an unlocked check already saw the path
+        absent, so a directory that existed before the move is always refused,
+        even when empty, and one that holds any visible entry is refused too.
+        """
+        try:
+            stat = await self._async_agfs.stat(path)
+        except Exception as exc:
+            if is_not_found_error(exc):
+                return
+            mapped = map_exception(exc, resource=uri)
+            if mapped is not None:
+                raise mapped from exc
+            raise
+        if allow_lock_placeholder and isinstance(stat, dict) and stat.get("isDir", False):
+            entries = await self._async_agfs.ls(path)
+            if not any(
+                (name := entry.get("name", "")) not in ("", ".", "..")
+                and not is_storage_internal_name(name)
+                for entry in entries
+            ):
+                return
+        raise ConflictError(f"Transfer destination already exists: {uri}", resource=uri)
+
     async def _prepare_transfer_entries(
         self,
         old_uri: str,
@@ -713,11 +749,18 @@ class _OpsMixin:
         *,
         vector_mode: Literal["transfer", "delete_source", "none"] = "transfer",
         copy_semantic_sidecars: bool = True,
+        no_replace: bool = False,
     ) -> Dict[str, Any]:
         """Move file/directory while extending an optional outer pathlock lease.
 
         Implemented as cp + rm to avoid lock files being carried by FS mv.
         On VectorDB update failure the copy is cleaned up so the source stays intact.
+
+        With ``no_replace`` the destination must be absent. It is checked before
+        locking and again under the source and destination locks, before any copy,
+        index transfer or delete; an occupied destination raises ``ConflictError``
+        and nothing is changed. Without it an existing file is overwritten and an
+        existing directory is merged, as before.
         """
 
         old_uri = self._normalize_transfer_uri(old_uri)
@@ -754,6 +797,8 @@ class _OpsMixin:
         if is_dir:
             await self._ensure_access(old_uri, ctx, action=AclAction.MANAGE)
         await self._ensure_transfer_parent_directory(new_path, new_uri, operation="mv")
+        if no_replace:
+            await self._ensure_transfer_destination_absent(new_path, new_uri)
         await self._ensure_transfer_target_type(new_path, new_uri, is_dir=is_dir)
 
         if not is_dir:
@@ -793,6 +838,10 @@ class _OpsMixin:
 
         operation_id = uuid.uuid4().hex
         try:
+            if no_replace:
+                await self._ensure_transfer_destination_absent(
+                    new_path, new_uri, allow_lock_placeholder=is_dir
+                )
             uris_to_move = await self._prepare_transfer_entries(
                 old_uri, new_uri, is_dir=is_dir, move=True, ctx=ctx
             )

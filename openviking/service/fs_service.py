@@ -1050,15 +1050,26 @@ class FSService:
             result["semantic_error"] = str(exc)
         return result
 
-    async def mv(self, from_uri: str, to_uri: str, ctx: RequestContext) -> None:
-        """Move a resource without exposing a cancellable partial transaction."""
+    async def mv(
+        self,
+        from_uri: str,
+        to_uri: str,
+        ctx: RequestContext,
+        *,
+        no_replace: bool = False,
+    ) -> None:
+        """Move a resource without exposing a cancellable partial transaction.
+
+        With ``no_replace`` an occupied destination (file or directory) is refused
+        with ``ConflictError`` before any copy, delete or index transfer.
+        """
         from_uri = VikingFS._normalize_transfer_uri(from_uri)
         to_uri = VikingFS._normalize_transfer_uri(to_uri)
         self._reject_storage_internal_target(to_uri)
         self._reject_file_only_semantic_sidecar_target(to_uri)
         validate_account_memory_template_transfer(to_uri)
         await self._finish_transfer_after_caller_cancel(
-            self._mv_and_refresh(from_uri, to_uri, ctx=ctx),
+            self._mv_and_refresh(from_uri, to_uri, ctx=ctx, no_replace=no_replace),
             operation="move",
         )
 
@@ -1068,9 +1079,19 @@ class FSService:
         to_uri: str,
         *,
         ctx: RequestContext,
+        no_replace: bool = False,
     ) -> None:
         """Commit move/watch state and enqueue all affected parent refreshes."""
         viking_fs = self._ensure_initialized()
+        if no_replace:
+            # Fail fast before version or watch bookkeeping; VikingFS.mv repeats
+            # the check under the transfer locks, which is the authoritative one.
+            # Authorize first so a 409 never reveals a name the caller cannot write.
+            await viking_fs._ensure_access(from_uri, ctx, action=AclAction.WRITE)
+            await viking_fs._ensure_access(to_uri, ctx, action=AclAction.WRITE)
+            await viking_fs._ensure_transfer_destination_absent(
+                viking_fs._uri_to_path(to_uri, ctx=ctx), to_uri
+            )
         watch_manager = self._get_watch_manager()
         use_watch_transaction = (
             watch_manager is not None
@@ -1112,6 +1133,7 @@ class FSService:
                         to_uri,
                         ctx=ctx,
                         **options,
+                        **({"no_replace": True} if no_replace else {}),
                     )
                     if use_watch_transaction:
                         try:

@@ -64,6 +64,10 @@ class BatchWriteOperation(BaseModel):
     mode: Literal["replace", "append", "create", "upsert"] = "replace"
     # Optional byte revision, checked under the existing file locks before any writes.
     expected_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    # Optional create-only precondition, checked under the same file locks before any
+    # writes: the target must not exist as a file or a directory. Without it, create
+    # keeps its documented materialization behavior and may replace an existing file.
+    expected_absent: bool = False
     tags: list[str] | None = None
     tag_mode: Literal["replace", "append", "clear"] = "replace"
     acl: AclSpec | None = None
@@ -72,6 +76,8 @@ class BatchWriteOperation(BaseModel):
     def validate_content_shape(self) -> "BatchWriteOperation":
         if (self.content is None) == (self.content_base64 is None):
             raise ValueError("exactly one of content or content_base64 is required")
+        if self.expected_absent and self.expected_sha256 is not None:
+            raise ValueError("expected_absent and expected_sha256 are mutually exclusive")
         return self
 
 
