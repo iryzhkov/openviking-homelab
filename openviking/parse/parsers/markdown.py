@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import yaml
-
 from openviking.parse.accessors.mime_types import IANA_MEDIA_TYPE_TO_EXTENSION
 from openviking.parse.base import NodeType, ParseResult, ResourceNode, create_parse_result
 from openviking.parse.image_validation import is_valid_image
@@ -351,6 +350,7 @@ class MarkdownParser(BaseParser):
                 rewrite_ctx=rewrite_ctx,
                 base_dir=base_dir,
                 allowed_media_dirs=allowed_media_dirs,
+                allow_media_resolution=kwargs.get("allow_media_resolution", True),
             )
 
             parse_time = time.time() - start_time
@@ -473,6 +473,7 @@ class MarkdownParser(BaseParser):
         rewrite_ctx: Optional[_RewriteContext] = None,
         base_dir: Optional[Path] = None,
         allowed_media_dirs: Optional[List[Path]] = None,
+        allow_media_resolution: bool = True,
     ) -> None:
         """Phase 2 (write only): replay ``layout.ops`` against the real VikingFS —
         create dirs, write each section (rewriting relative links when enabled), then
@@ -511,7 +512,7 @@ class MarkdownParser(BaseParser):
         # glob+read over every chunk file we just wrote.
         images_started = time.perf_counter()
         has_image_refs = self._layout_has_local_image_refs(write_ops)
-        if has_image_refs:
+        if has_image_refs and allow_media_resolution:
             await self._ingest_local_images(
                 layout.root_dir,
                 base_dir,

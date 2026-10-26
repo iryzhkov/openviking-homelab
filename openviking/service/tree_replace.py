@@ -246,6 +246,7 @@ async def _tree_entries(
     fs_ctx: Dict[str, Any] | None,
     *,
     ctx: RequestContext | None = None,
+    max_entries: int = MAX_TREE_ENTRIES,
 ) -> List[Dict[str, Any]] | None:
     """Return the visible descendants of ``path`` with their stored bytes' hashes.
 
@@ -279,7 +280,7 @@ async def _tree_entries(
             await _require_tree_access(
                 viking_fs, uri, [f"{uri}/{relative}"], real_ctx, AclAction.READ
             )
-            if len(entries) >= MAX_TREE_ENTRIES:
+            if len(entries) >= max_entries:
                 raise ResourceExhaustedError(
                     "tree is too large for a guarded replacement",
                     details={"max_entries": MAX_TREE_ENTRIES},
