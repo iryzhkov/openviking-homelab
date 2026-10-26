@@ -102,6 +102,14 @@ async def _ingest(service, sample_markdown_file, trace):
         "semantic_identity": [d.get("resource_creation_identity") for d in semantic],
         "embedding_fenced": ["_resource_fence" in json.dumps(d) for d in embedding],
         "records": sorted((r.get("uri"), r.get("level")) for r in resource_records),
+        "bodies": {
+            f"{r.get('uri')}#{r.get('level')}": {
+                "abstract": r.get("abstract"),
+                "account_id": r.get("account_id"),
+                "has_vector": bool(r.get("vector")) or "vector" not in r,
+            }
+            for r in resource_records
+        },
     }
 
 
@@ -179,17 +187,6 @@ async def test_real_resource_ingest_reaches_actual_handlers(
     assert summary["records"], detail
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "PRODUCT: concurrent resource embedding fences each take resources-root "
-        "tree coverage via _acquire_resource_coverage, whose "
-        "pathlock_acquire_batch has no timeout (fails at 0 ms). The overlapping "
-        "acquisition refuses, the vector write fails ('lock acquire timed out "
-        "after 0ms, uri=viking://resources/sample'), and add_resource returns "
-        "status=error with no root_uri."
-    ),
-)
 async def test_real_resource_ingest_succeeds_with_root_uri(
     admitted_service, sample_markdown_file, trace, monkeypatch
 ):
@@ -200,7 +197,21 @@ async def test_real_resource_ingest_succeeds_with_root_uri(
     assert summary["result"].get("root_uri"), detail
     assert summary["result"].get("status") == "success", detail
     root = summary["root_uri"]
+    assert summary["result"]["root_uri"] == root, detail
     assert (root, 0) in summary["records"] and (root, 1) in summary["records"], detail
+    file_uri = root + "/sample.md"
+    assert (file_uri, 2) in summary["records"], detail
+    for key in (f"{root}#0", f"{root}#1", f"{file_uri}#2"):
+        body = summary["bodies"][key]
+        assert body["account_id"] == _root_ctx().account_id, detail
+        assert body["abstract"], detail
+    original = await _creation_identity(admitted_service)
+    assert set(summary["semantic_identity"]) == {original}, detail
+    assert summary["embedding_fenced"] and all(summary["embedding_fenced"]), detail
+    # No resource-root coverage acquisition was refused by the native manager.
+    assert not any(
+        event[0] == "pathlock_acquire_batch" and str(event[-1]).startswith("ERR") for event in locks
+    ), detail
 
 
 async def test_account_recreated_before_semantic_processing_refuses_publication(

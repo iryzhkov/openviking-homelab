@@ -166,7 +166,9 @@ class _OpsMixin:
             raise FailedPreconditionError("Qualified resources operations require an account identity manager")
         return await capture_account_identity(manager, self._ctx_or_default(ctx).account_id)
 
-    async def _acquire_resource_coverage(self, ctx, admitted, *, requests=(), owner_lease_ref=None):
+    async def _acquire_resource_coverage(
+        self, ctx, admitted, *, requests=(), owner_lease_ref=None, timeout_secs: float = 0.0
+    ):
         from openviking.service.account_identity import recheck_account_identity
         real_ctx = self._ctx_or_default(ctx)
         root = self._uri_to_path("viking://resources", ctx=real_ctx)
@@ -182,6 +184,7 @@ class _OpsMixin:
             coverage = [{"path": account_root, "kind": "tree"}]
         lease = await self._async_agfs.pathlock_acquire_batch(
             self._collapse_lock_requests(coverage),
+            timeout_secs=timeout_secs,
             owner_lease_ref=owner_lease_ref,
         )
         try:

@@ -20,6 +20,12 @@ from openviking.storage.pathlock_transfer import PathLockGuard
 from openviking.storage.vector_ids import vector_record_id
 from openviking.utils.content_hash import content_md5
 
+# Concurrent embedding fences of one account each take resources-root coverage.
+# Wait a bounded time in the native lock manager for a sibling fence to finish
+# instead of failing at 0 ms; every condition is still rechecked after the
+# acquisition, and a holder beyond the bound still fails closed.
+RESOURCE_EMBEDDING_COVERAGE_WAIT_SECS = 5.0
+
 
 class ResourceEmbeddingConflict(ValueError):
     """A resource embedding no longer has qualified original inputs."""
@@ -212,7 +218,10 @@ async def stamp_resource_embedding(msg):
     ):
         raise ResourceEmbeddingConflict("Resource embedding producer lacks input coverage")
     lease = await fs._acquire_resource_coverage(
-        producer.ctx, producer.identity, owner_lease_ref=producer.owner
+        producer.ctx,
+        producer.identity,
+        owner_lease_ref=producer.owner,
+        timeout_secs=RESOURCE_EMBEDDING_COVERAGE_WAIT_SECS,
     )
     guard = PathLockGuard(fs._async_agfs, lease)
     try:
@@ -345,7 +354,10 @@ async def resource_embedding_commit(msg, ctx, db):
     # D3 rechecks the authoritative creation identity/deleting flag AFTER this
     # final acquisition. Reentrant extension keeps a live semantic owner intact.
     lease = await fs._acquire_resource_coverage(
-        ctx, AccountIdentity(identity, False), owner_lease_ref=owner
+        ctx,
+        AccountIdentity(identity, False),
+        owner_lease_ref=owner,
+        timeout_secs=RESOURCE_EMBEDDING_COVERAGE_WAIT_SECS,
     )
     guard = PathLockGuard(fs._async_agfs, lease)
     try:
