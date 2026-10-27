@@ -2,7 +2,8 @@
 
 This recipe assembles files only. It does not start a container, server, CLI,
 native module or queue consumer. Run it on agent-a through Chaldea, with
-HOME and TMPDIR asserted under the job's disk-backed .cache/candidate directory.
+TMPDIR asserted as the job's physical disk-backed .cache/candidate directory,
+and HOME asserted as $TMPDIR/home before writes.
 Do not use the upstream Dockerfile or resolve dependencies.
 
 Inputs are fixed in inputs.json. The accepted product is 5ba1ffaa678c; the
@@ -27,7 +28,7 @@ retained binary digest establish correspondence, not a fresh reproducible build.
 
 Typical job command, from the prepared snapshot:
 
-    chaldea exec --host agent-a --queue-timeout 1m --artifact candidate-patch.tar -- timeout -k 15 600 sh -c 'jobroot=$(pwd -P); export HOME="$jobroot/.cache/candidate/home" TMPDIR="$jobroot/.cache/candidate/tmp"; test "$HOME" = "$jobroot/.cache/candidate/home" && test "$TMPDIR" = "$jobroot/.cache/candidate/tmp" && test "$(stat -f -c %T "$jobroot")" != tmpfs && mkdir -p "$HOME" "$TMPDIR" && python3 -I source-ci/candidate/assemble.py'
+    chaldea exec --host agent-a --queue-timeout 1m --artifact candidate-patch.tar -- timeout -k 15 600 sh -c 'jobroot=$(pwd -P); export TMPDIR="$jobroot/.cache/candidate"; export HOME="$TMPDIR/home"; test "$TMPDIR" = "$jobroot/.cache/candidate" && test "$HOME" = "$TMPDIR/home" && test "$(realpath -m "$TMPDIR")" = "$jobroot/.cache/candidate" && test "$(realpath -m "$HOME")" = "$jobroot/.cache/candidate/home" && test "$(stat -f -c %T "$jobroot")" != tmpfs && mkdir -p "$HOME" "$TMPDIR" && python3 -I source-ci/candidate/assemble.py'
 
 The caller must assert these scratch paths before creating them, as the
 qualification launcher does. The recipe repeats those assertions. Never run

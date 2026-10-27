@@ -59,8 +59,11 @@ def record(path, value):
 def main():
     root = Path.cwd().resolve()
     scratch = root / ".cache/candidate"
+    assert os.environ["TMPDIR"] == str(scratch)
     assert os.environ["HOME"] == str(scratch / "home")
-    assert os.environ["TMPDIR"] == str(scratch / "tmp")
+    assert Path(os.environ["TMPDIR"]).resolve() == scratch
+    assert Path(os.environ["HOME"]).resolve() == scratch / "home"
+    assert Path(os.environ["HOME"]).parent == Path(os.environ["TMPDIR"])
     assert "/tmp" != str(scratch) and not scratch.is_symlink()
     assert subprocess.check_output(["stat", "-f", "-c", "%T", str(root)]).strip() != b"tmpfs"
     scratch.mkdir(parents=True, exist_ok=True)
