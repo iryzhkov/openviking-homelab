@@ -1,0 +1,52 @@
+{
+  "schema": "openviking-homelab/source-native-inputs/v1",
+  "backend_repository": "iryzhkov/openviking-homelab",
+  "backend_publication_status": "private_verified_by_root",
+  "accepted_backend_commit": "5ba1ffaa678cf88be2af472747f8d21cf582094c",
+  "accepted_backend_tree": "c2851be508532ed961fe707d2728f393ab714573",
+  "http_repository": "iryzhkov/ov-mcp",
+  "accepted_http_commit": "1c80c90e02a50a168c7f7ef02fd7c9aebaeb8319",
+  "accepted_http_tree": "651a695611641667e63b9b1d78e27b6b5387dc7b",
+  "http_merge_commit": "4cc776bc4f9a9211b1106f2ba3299d92e82690be",
+  "http_source_pr": "https://github.com/iryzhkov/ov-mcp/pull/6",
+  "http_hosted_tests_prior_evidence": 541,
+  "native_sha256": "8be7869a9f326ccd6cb67e093216f74296d1e98e93a73290918e6f33744ea1ad",
+  "native_size_bytes": 34413952,
+  "native_build_source_commit": "0ff04af959195ea3dd5f3c0e4314fc2209fd0053",
+  "native_git_inputs": {
+    "crates/ragfs": "1e51698f7751655a43518bb8c5675db0c68768b7",
+    "crates/ragfs-python": "bba6c803bc9ccd2e3c23553538f92487be4a7698",
+    "Cargo.toml": "f44b1edc3eec9bec943a5e37148b2a832d1f6c17",
+    "Cargo.lock": "585b8b6e4485ca1113e549f48e8205783d3c3112"
+  },
+  "source_sha256": {
+    "tests/filter_contract/test_resources_exact_delete_filter.py": "9210fa50f899c81feb77f234066181f7574d86f8897276d32c5e8f18c871c331",
+    "openviking/storage/viking_vector_index_backend.py": "0c7ec992ae8deef5b7f6d7f1b212378494c19f01f5fcf79c4b82564e7c2ad820"
+  },
+  "base_image": "ghcr.io/volcengine/openviking@sha256:2ae2799dac1e606218d9ffeb06af3b65c8218b3556555620a369ed81b7c5aa1f",
+  "base_image_config_sha256": "56a10cc7c1d32307877a2669a6d42b2eecd787ae1d6faf8d9e80d7737fefdcfa",
+  "base_manifest_sha256": "774312224cf4d378a21a9a4062bfc279a3fe89451ad11b2104629f8c4c4bc156",
+  "native_byte_evidence": "prior_local_receipts_only",
+  "native_bytes_rehashed_by_source_ci": false,
+  "reproducible_build": "unqualified",
+  "deployment_candidate_oci_digest": null,
+  "deployment_candidate_status": "absent",
+  "deployment_boundary": "one serving process; x86_64 GNU; glibc >= 2.38",
+  "harness_origin": {
+    "commit": "41fe2e3cec70dfe435498088dbd70a94659f7c24",
+    "tree": "8019dca2ff8beedeff5c5f9428811113f22125a3",
+    "blobs": {
+      "run_checks.sh": "31441ba5aca3dea51fbe3176ddca47910a40633b",
+      "fetch_image.py": "15b59a39ac188f7a4e1c642840da5a16ad989103",
+      "origin_plugin.py": "502784f8067e08104f50770b1c77ccb6911bb20e",
+      "base-manifest.sha256": "3d1b5e45b31d243e8514b43170b6bd187a338948"
+    }
+  },
+  "action_pins": {
+    "actions/checkout": "d23441a48e516b6c34aea4fa41551a30e30af803",
+    "actions/setup-python": "ece7cb06caefa5fff74198d8649806c4678c61a1",
+    "astral-sh/setup-uv": "37802adc94f370d6bfd71619e3f0bf239e1f3b78"
+  },
+  "uv_version": "0.13.1",
+  "ruff_version": "0.15.5"
+}

@@ -1,0 +1,48 @@
+name: Focused source checks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          submodules: false
+      - name: Initialize disk scratch
+        shell: bash
+        run: |
+          export TMPDIR="$GITHUB_WORKSPACE/.cache/exact-filter/tmp"
+          export HOME="$TMPDIR/home"
+          test "$HOME" = "$TMPDIR/home"
+          test "$(stat -f -c %T "$GITHUB_WORKSPACE")" != tmpfs
+          mkdir -p "$HOME" "$TMPDIR"
+          printf 'HOME=%s\nTMPDIR=%s\nUV_CACHE_DIR=%s\n' "$HOME" "$TMPDIR" "$GITHUB_WORKSPACE/.cache/exact-filter/uv-cache" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: "0.13.1"
+          enable-cache: false
+      - name: Check exact source and pure filters
+        shell: bash
+        run: timeout -k 15 360 sh source-ci/run_checks.sh
+      - name: Report source evidence
+        if: always()
+        shell: bash
+        run: |
+          if test -f filter-out/summary.json; then
+            cat filter-out/summary.json
+            cat filter-out/summary.json >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if test -f filter-out/checkout.json; then
+            cat filter-out/checkout.json
+          fi
