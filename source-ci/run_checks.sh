@@ -19,7 +19,6 @@ finish() {
 }
 trap finish 0
 trap 'exit 124' TERM INT
-printf 'HOME=%s\nTMPDIR=%s\n' "$HOME" "$TMPDIR" > "$out/scratch.txt"
 if [ -e .git ]; then
  python3 -I source-ci/attest.py collect "$out"
 else
@@ -27,6 +26,7 @@ else
  cp "$SOURCE_CI_PREPARED/checkout.json" "$SOURCE_CI_PREPARED/inventory.json" "$out/"
 fi
 python3 -I source-ci/attest.py verify "$out"
+printf 'HOME=%s\nTMPDIR=%s\n' "$HOME" "$TMPDIR" > "$out/scratch.txt"
 sh -n source-ci/run_checks.sh
 python3 -I - <<'PY'
 import ast,json,pathlib
