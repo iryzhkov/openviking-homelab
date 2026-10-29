@@ -7,10 +7,12 @@ and HOME asserted as $TMPDIR/home before writes.
 Do not use the upstream Dockerfile or resolve dependencies.
 
 Inputs are fixed in inputs.json. This locally prepared candidate pins product
-a65f2fde663a51ed6b58601d251c51d7cd033006, tree
-badba2e2cdd1bd4e37d15579436e64bc838d57f0. Local integration e00502df926b4c6c3a2cc3faa8b196bc1aeb3737,
-tree 9996e4312da5f219191d62aee73424973113663c, preserves public main
-0cde16d02fde0459a818ea69e01fcc1f4d2f4c94 and the candidate ancestry.
+71065c06ab5a1bc85ddc880166667fe1b00de423, tree
+7025f88e4a5c545b0b91235688cd56d22f17dab1. Local integration e03c84c78cc77559c1b99ab43fba5f34704248e0,
+tree 913e07c5dde19402b40d5044609eb0d9803634c9, preserves public main
+0cde16d02fde0459a818ea69e01fcc1f4d2f4c94, prior candidate a65f2fde and
+corrected product ancestry. Its standalone native/adapter proof is opt-in under
+test_scripts/account_embedding/, outside default product test discovery.
 Only openviking/service/document_write.py changes in the selected product;
 both dependency locks and all native Git inputs remain pinned. Root owns
 final acceptance, source checks and assembly dispatch. No new candidate image

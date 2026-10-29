@@ -3,9 +3,9 @@
   "base": "ghcr.io/volcengine/openviking@sha256:2ae2799dac1e606218d9ffeb06af3b65c8218b3556555620a369ed81b7c5aa1f",
   "base_config": "sha256:56a10cc7c1d32307877a2669a6d42b2eecd787ae1d6faf8d9e80d7737fefdcfa",
   "base_origin": "7f3ae1af822d936c1d0b070537772b0f1d59122f",
-  "product": "a65f2fde663a51ed6b58601d251c51d7cd033006",
-  "product_tree": "badba2e2cdd1bd4e37d15579436e64bc838d57f0",
-  "selection_sha256": "d114a2e7c79cca81111112dbe7515479f35337529954fb50d7fbd36476a0c498",
+  "product": "71065c06ab5a1bc85ddc880166667fe1b00de423",
+  "product_tree": "7025f88e4a5c545b0b91235688cd56d22f17dab1",
+  "selection_sha256": "1f56e7d8aa6281ed49ca9ca1aed131515276fc8bd0ca70bcaffd66b5b60c6b86",
   "product_count": 915,
   "product_bytes": 10109896,
   "native": {
