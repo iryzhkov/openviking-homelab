@@ -5,7 +5,6 @@ No import/watch controls and no persisted journal. Rollback is same-process only
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import re
@@ -510,8 +509,7 @@ async def _embed_private_records(fs, records, root_uri, bodies, ctx, admitted, l
         if len(raw) > MAX_TEXT_BYTES:
             raise ResourceExhaustedError("Private policy embedding input limit exceeded")
         await _live(fs, ctx, admitted, lease)
-        embedded = await asyncio.to_thread(
-            fs.query_embedder.embed,
+        embedded = await fs._get_embedder(ctx).embed_async(
             record["uri"] + "\n" + raw.decode("utf-8", errors="replace"),
             is_query=False,
         )

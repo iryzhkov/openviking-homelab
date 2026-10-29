@@ -1,25 +1,45 @@
-"""Run exactly one bounded native case; export closed regular evidence only."""
+"""Run selected bounded native document checks; export closed regular evidence only."""
+
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 out = Path(os.environ["PROOF_OUT"])
 assert os.environ["HOME"] == os.environ["TMPDIR"] + "/home"
 private = Path(os.environ["HOME"]) / "slice-private-output"
 private.mkdir(mode=0o700)
-case = out / "case-0"; case.mkdir()
+case = out / "case-0"
+case.mkdir()
 name = "tests/server/test_first_image_write_vertical_slice.py::test_fresh_admin_deferred_raw_write"
 env = dict(os.environ, PROOF_OUT=str(case))
-command = [sys.executable, "-u", "-m", "pytest", "-p", "origin_plugin",
-           "-q", "--tb=no", "--show-capture=no", "-p", "no:cacheprovider",
-           "-o", "junit_logging=no", "-o", "junit_log_passing_tests=false",
-           "--junitxml=" + str(private / "junit.xml"), name]
+command = [
+    sys.executable,
+    "-u",
+    "-m",
+    "pytest",
+    "-p",
+    "origin_plugin",
+    "-q",
+    "--tb=no",
+    "--show-capture=no",
+    "-p",
+    "no:cacheprovider",
+    "-o",
+    "junit_logging=no",
+    "-o",
+    "junit_log_passing_tests=false",
+    "--junitxml=" + str(private / "junit.xml"),
+    name,
+    "tests/server/test_document_write.py",
+]
 try:
     with (private / "case.log").open("w") as stream:
-        result = subprocess.run(command, env=env, stdout=stream, stderr=subprocess.STDOUT, timeout=240)
+        result = subprocess.run(
+            command, env=env, stdout=stream, stderr=subprocess.STDOUT, timeout=240
+        )
     code = result.returncode
 except subprocess.TimeoutExpired:
     code = 124
@@ -33,8 +53,13 @@ if (private / "junit.xml").is_file():
 public = ET.Element("testsuites")
 ET.SubElement(public, "testsuite", name="focused_native_vertical_slice", **counts)
 (out / "junit.xml").write_bytes(ET.tostring(public))
-summary = {"exit_code": code, "case": "fresh_admin_deferred_raw_write", "counts": counts,
-           "raw_case_output_exported": False, "single_native_attempt": True}
+summary = {
+    "exit_code": code,
+    "case": "fresh_admin_deferred_raw_write",
+    "counts": counts,
+    "raw_case_output_exported": False,
+    "single_native_attempt": True,
+}
 (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 (out / "pytest.txt").write_text(json.dumps(summary) + "\n")
 if (case / "collected-origins.json").is_file():
@@ -42,6 +67,6 @@ if (case / "collected-origins.json").is_file():
 else:
     (out / "collected-origins.json").write_text("[]\n")
 print(json.dumps(summary), flush=True)
-if (case / "closed-proof.json").is_file():
-    print((case / "closed-proof.json").read_text(), flush=True)
+for proof in sorted(case.glob("closed-proof-*.json")):
+    print(proof.read_text(), flush=True)
 sys.exit(code)
