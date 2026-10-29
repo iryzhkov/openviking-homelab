@@ -137,6 +137,15 @@ async def test_fresh_admin_deferred_raw_write(monkeypatch, mode):
         monkeypatch.setattr(provider, "bind", bind)
         real_prepare, real_write = dw._prepare, dw.write_document
         real_embed_private, real_publish = dw._embed_private_records, dw._publish_records
+        real_live = dw._live
+
+        async def live(*args, **kwargs):
+            if report.get("lease_released_during_embed"):
+                report["post_embed_live_called"] = True
+                save()
+            return await real_live(*args, **kwargs)
+
+        monkeypatch.setattr(dw, "_live", live)
         held = {}
         report["formal_publication_calls"] = 0
 
@@ -422,7 +431,9 @@ async def test_fresh_admin_deferred_raw_write(monkeypatch, mode):
                     assert report["native_cause_type"] == "RuntimeError"
                 else:
                     assert report["lease_released_during_embed"]
-                    assert report["native_error_code"] == "CONFLICT"
+                    assert report["post_embed_live_called"]
+                    assert report["native_cause_type"] == "ValueError"
+                    assert report["native_error_code"] == "INTERNAL"
             report["state"] = "passed"
             save()
     except BaseException as exc:

@@ -33,7 +33,6 @@ command = [
     "junit_log_passing_tests=false",
     "--junitxml=" + str(private / "junit.xml"),
     name,
-    "tests/server/test_document_write.py",
 ]
 try:
     with (private / "case.log").open("w") as stream:
