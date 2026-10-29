@@ -6,9 +6,15 @@ TMPDIR asserted as the job's physical disk-backed .cache/candidate directory,
 and HOME asserted as $TMPDIR/home before writes.
 Do not use the upstream Dockerfile or resolve dependencies.
 
-Inputs are fixed in inputs.json. The accepted product is 5ba1ffaa678c; the
-source-CI base is 1b2d65c480c4, tree f75257cf6f36. Product paths and both lock
-files are unchanged from the receipts. The 915 tracked regular files under
+Inputs are fixed in inputs.json. This locally prepared candidate pins product
+a65f2fde663a51ed6b58601d251c51d7cd033006, tree
+badba2e2cdd1bd4e37d15579436e64bc838d57f0. Local integration e00502df926b4c6c3a2cc3faa8b196bc1aeb3737,
+tree 9996e4312da5f219191d62aee73424973113663c, preserves public main
+0cde16d02fde0459a818ea69e01fcc1f4d2f4c94 and the candidate ancestry.
+Only openviking/service/document_write.py changes in the selected product;
+both dependency locks and all native Git inputs remain pinned. Root owns
+final acceptance, source checks and assembly dispatch. No new candidate image
+or digest exists from this preparation. The 915 tracked regular files under
 openviking/ and openviking_cli/ are selected by local Git metadata. The supplied
 selection.json records each path, Git mode, blob, SHA256 and size. Its digest
 is pinned here. All tracked source LICENSE/NOTICE files are carried verbatim,
