@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from openviking.config.embedding import AccountBoundEmbedder
 from openviking.server.auth import get_request_context
 from openviking.server.identity import RequestContext, Role
 from openviking.service.document_write import DocumentWriteRequest, document_node, write_document
@@ -11,17 +12,27 @@ from openviking.storage.acl import AclMode
 from openviking.utils.media_processor import UnifiedResourceProcessor
 from openviking_cli.exceptions import ConflictError, OpenVikingError, PermissionDeniedError
 from openviking_cli.session.user_id import UserIdentifier
-from tests.server.conftest import app as app
-from tests.server.conftest import client as client
-from tests.server.conftest import service as service
-from tests.server.conftest import temp_dir as temp_dir
-from tests.server.test_real_resource_producer_e2e import _root_ctx
-from tests.server.test_real_resource_producer_e2e import admitted_service as admitted_service
+from tests.server import conftest as server_fixtures
+from tests.server import test_real_resource_producer_e2e as producer_fixtures
+
+app = server_fixtures.app
+client = server_fixtures.client
+service = server_fixtures.service
+temp_dir = server_fixtures.temp_dir
+admitted_service = producer_fixtures.admitted_service
+_root_ctx = producer_fixtures._root_ctx
 
 BASE = "viking://resources"
 TARGET = BASE + "/document.md"
 BACKUP = BASE + "/saved.md"
 HINT = "Process the literal cobalt decision."
+
+
+@pytest.fixture(autouse=True)
+def normal_account_embedder(service, monkeypatch):
+    """Exercise the supported account API, not the shared fixture legacy shortcut."""
+    monkeypatch.setattr(service.viking_fs, "query_embedder", None)
+    assert service.viking_fs._embedding_provider is not None
 
 
 async def settle(service):
@@ -256,11 +267,11 @@ async def test_stale_controls_and_same_process_rollback(admitted_service, monkey
         )
     assert (await document_node(service, BACKUP, ctx))["node"]["kind"] == "absent"
 
-    def fail_embedding(*args, **kwargs):
+    async def fail_embedding(*args, **kwargs):
         raise RuntimeError("injected private embedding failure")
 
     with monkeypatch.context() as patch:
-        patch.setattr(type(service.viking_fs.query_embedder), "embed", fail_embedding)
+        patch.setattr(AccountBoundEmbedder, "embed_async", fail_embedding)
         with pytest.raises(OpenVikingError) as embedding_error:
             await write_document(service, request, ctx)
         assert embedding_error.value.details["content_state"] == "not_started"
@@ -377,12 +388,12 @@ async def test_unindexed_original_rollback(admitted_service, monkeypatch, kind):
     outsider = RequestContext(user=UserIdentifier(ctx.account_id, "outsider"), role=Role(Role.USER))
     original_write = fs.write_file_bytes
     first_bytes, phases, embedded = [], [], []
-    original_embed = type(fs.query_embedder).embed
+    original_embed = AccountBoundEmbedder.embed_async
 
-    def embed(self, *args, **kwargs):
+    async def embed(self, *args, **kwargs):
         assert "install" not in phases, "rollback must not call the model"
         embedded.append(args[0])
-        return original_embed(self, *args, **kwargs)
+        return await original_embed(self, *args, **kwargs)
 
     async def protected_write(uri, data, *args, **kwargs):
         result = await original_write(uri, data, *args, **kwargs)
@@ -397,7 +408,7 @@ async def test_unindexed_original_rollback(admitted_service, monkeypatch, kind):
         if phase == "install":
             raise OSError("one-shot install fault")
 
-    monkeypatch.setattr(type(fs.query_embedder), "embed", embed)
+    monkeypatch.setattr(AccountBoundEmbedder, "embed_async", embed)
     monkeypatch.setattr(fs, "write_file_bytes", protected_write)
     with pytest.raises(OpenVikingError) as raised:
         await write_document(
