@@ -13,7 +13,7 @@ private = Path(os.environ["HOME"]) / "slice-private-output"
 private.mkdir(mode=0o700)
 case = out / "case-0"
 case.mkdir()
-name = "tests/server/test_first_image_write_vertical_slice.py::test_fresh_admin_deferred_raw_write"
+name = "test_scripts/account_embedding/raw_write_proof.py::test_fresh_admin_deferred_raw_write"
 env = dict(os.environ, PROOF_OUT=str(case))
 command = [
     sys.executable,
