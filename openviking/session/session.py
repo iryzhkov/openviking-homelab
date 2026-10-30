@@ -728,7 +728,9 @@ class Session:
         try:
             if await self.exists():
                 return
-            await self._viking_fs.mkdir(self._session_uri, exist_ok=True, ctx=self.ctx)
+            await self._viking_fs.mkdir(
+                self._session_uri, exist_ok=True, ctx=self.ctx, lease_ref=lease
+            )
             await self._viking_fs.write_file(
                 f"{self._session_uri}/messages.jsonl",
                 "",
@@ -739,7 +741,9 @@ class Session:
             await self._viking_fs._async_agfs.pathlock_release(lease)
 
     @asynccontextmanager
-    async def _state_lock(self, *filenames: str) -> AsyncIterator[Dict[str, Any]]:
+    async def _state_lock(
+        self, *filenames: str, require_existing: bool = False
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Serialize Session mutations, then protect their root-file snapshots.
 
         A directory Exact lease is a Session mutex, not a lease for its children.
@@ -751,6 +755,10 @@ class Session:
             session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
         )
         try:
+            if require_existing and not await self.exists():
+                from openviking_cli.exceptions import NotFoundError
+
+                raise NotFoundError(self.session_id, "session")
             file_lease = await agfs.pathlock_acquire_exact_batch(
                 [f"{session_path}/{name}" for name in filenames],
                 timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS,
@@ -830,14 +838,20 @@ class Session:
             role == "user" and len(parts) > 1 and all(isinstance(part, ToolPart) for part in parts)
         )
 
-    async def _append_messages_authoritatively(self, messages: List[Message]) -> None:
+    async def _append_messages_authoritatively(
+        self, messages: List[Message], *, qualified_specs: Optional[List[dict]] = None
+    ) -> None:
         """Reload and append under the session path lock.
 
         Different workers can hold stale Session objects. Without sharing the
         commit lock, an append between commit's root read and root rewrite can
         be overwritten even though add_message already returned successfully.
         """
-        if not messages:
+        if qualified_specs is not None and not self._viking_fs:
+            from openviking_cli.exceptions import FailedPreconditionError
+
+            raise FailedPreconditionError("Qualified append requires persisted session storage")
+        if not messages and qualified_specs is None:
             if self._viking_fs:
                 await self.load()
             return
@@ -847,8 +861,20 @@ class Session:
 
         snapshot: Optional[SessionExpirySnapshot] = None
         snapshot_error: Optional[Exception] = None
-        async with self._state_lock("messages.jsonl", ".meta.json") as lease:
+        async with self._state_lock(
+            "messages.jsonl", ".meta.json", require_existing=qualified_specs is not None
+        ) as lease:
             content = await self._reload()
+            if qualified_specs is not None:
+                from openviking_cli.exceptions import FailedPreconditionError
+
+                if self._meta.auto_commit_policy is not None:
+                    raise FailedPreconditionError(
+                        "Qualified append requires automatic commits already disabled"
+                    )
+                # Privacy storage and tool externalization also stay behind the
+                # checks and the same lock as the authoritative write.
+                messages.extend(await self._prepare_appended_messages(qualified_specs))
             await self._apply_appended_messages_to_state(messages)
             batch_content = "".join(message.to_jsonl() + "\n" for message in messages)
             # Payloads are already protected. Bytes bypass the generic sanitizer
@@ -986,8 +1012,23 @@ class Session:
     async def add_messages_async(
         self,
         messages_spec: List[dict],
+        *,
+        require_existing_no_auto_commit: bool = False,
     ) -> List[Message]:
-        """Asynchronously add multiple messages without blocking the caller loop."""
+        """Append, optionally requiring an existing session with auto-commit disabled.
+
+        Qualified checks, privacy processing and persistence share the native
+        Session lock. This never changes the session policy.
+        """
+        if require_existing_no_auto_commit:
+            messages: List[Message] = []
+            await self._append_messages_authoritatively(messages, qualified_specs=messages_spec)
+            return messages
+        messages = await self._prepare_appended_messages(messages_spec)
+        await self._append_messages_authoritatively(messages)
+        return messages
+
+    async def _prepare_appended_messages(self, messages_spec: List[dict]) -> List[Message]:
         if self._privacy_config_service is not None:
             messages_spec = await extract_and_store_session_privacy(
                 self.session_id,
@@ -1003,7 +1044,6 @@ class Session:
                 group, self._tool_output_externalization_config
             )
             messages.extend(group)
-        await self._append_messages_authoritatively(messages)
         return messages
 
     def add_message(

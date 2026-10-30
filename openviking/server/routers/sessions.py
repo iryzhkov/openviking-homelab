@@ -141,6 +141,7 @@ class AddMessageRequest(BaseModel):
     If both are provided, `parts` takes precedence.
     """
 
+    append_mode: Optional[Literal["existing_only_no_auto_commit"]] = None
     role: str
     peer_id: Optional[str] = None
     content: Optional[str] = None
@@ -170,6 +171,12 @@ class BatchAddMessageRequest(BaseModel):
 
     messages: List[AddMessageRequest] = Field(..., max_length=100)
     telemetry: TelemetryRequest = False
+
+    @model_validator(mode="after")
+    def reject_single_message_append_mode(self) -> "BatchAddMessageRequest":
+        if any(message.append_mode is not None for message in self.messages):
+            raise ValueError("append_mode is supported only by the single-message endpoint")
+        return self
 
 
 class CreateSessionRequest(BaseModel):
@@ -732,7 +739,8 @@ async def add_message(
     service = get_service()
 
     async def _add() -> dict[str, Any]:
-        session = await service.sessions.open(session_id, _ctx, auto_create=True)
+        qualified = request.append_mode == "existing_only_no_auto_commit"
+        session = await service.sessions.open(session_id, _ctx, auto_create=not qualified)
         parts = _resolve_message_parts(request, _ctx)
 
         specs = [
@@ -747,17 +755,25 @@ async def add_message(
             }
         ]
         add_many_async = getattr(session, "add_messages_async", None)
-        if callable(add_many_async):
+        if qualified:
+            await session.add_messages_async(specs, require_existing_no_auto_commit=True)
+        elif callable(add_many_async):
             await add_many_async(specs)
         else:
             session.add_messages(specs)
-        await service.sessions.maybe_schedule_auto_commit(
-            session_id,
-            _ctx,
-            reason_hint="message_write",
-            session=session,
-        )
+        if not qualified:
+            await service.sessions.maybe_schedule_auto_commit(
+                session_id,
+                _ctx,
+                reason_hint="message_write",
+                session=session,
+            )
         return {
+            **(
+                {"append_mode": request.append_mode, "auto_commit_scheduled": False}
+                if qualified
+                else {}
+            ),
             "session_id": session_id,
             "message_count": len(session.messages),
             # Post-write value so a commit policy can decide without a
