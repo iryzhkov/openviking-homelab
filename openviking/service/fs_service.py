@@ -13,6 +13,17 @@ from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional
 
+from openviking_cli.exceptions import (
+    DeadlineExceededError,
+    InvalidArgumentError,
+    NotFoundError,
+    NotInitializedError,
+    PermissionDeniedError,
+    ResourceExhaustedError,
+)
+from openviking_cli.utils import VikingURI, get_logger
+from openviking_cli.utils.config import get_openviking_config
+
 from openviking.core.context import ContextLevel
 from openviking.core.namespace import (
     canonical_session_root,
@@ -63,16 +74,6 @@ from openviking.utils.embedding_utils import vectorize_directory_meta
 from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.path_safety import validate_safe_viking_uri_path
 from openviking.utils.tags import normalize_search_tags
-from openviking_cli.exceptions import (
-    DeadlineExceededError,
-    InvalidArgumentError,
-    NotFoundError,
-    NotInitializedError,
-    PermissionDeniedError,
-    ResourceExhaustedError,
-)
-from openviking_cli.utils import VikingURI, get_logger
-from openviking_cli.utils.config import get_openviking_config
 
 logger = get_logger(__name__)
 
@@ -646,8 +647,9 @@ class FSService:
         Never writes watch or Task state. The error names no watch, owner,
         Task or source.
         """
-        from openviking.resource.uri_mutation_coordinator import uri_matches_prefix
         from openviking_cli.exceptions import ConflictError, FailedPreconditionError
+
+        from openviking.resource.uri_mutation_coordinator import uri_matches_prefix
 
         targets = [uri.rstrip("/") for uri in uris if uri]
 

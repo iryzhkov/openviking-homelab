@@ -11,6 +11,8 @@ from copy import deepcopy
 from unittest.mock import create_autospec
 
 import pytest
+from openviking_cli.exceptions import DeadlineExceededError
+from openviking_cli.session.user_id import UserIdentifier
 
 from openviking.pyagfs.exceptions import AGFSAlreadyExistsError, AGFSNotFoundError
 from openviking.server.identity import RequestContext, Role
@@ -30,8 +32,6 @@ from openviking.service.task_tracker import (
     set_task_tracker,
 )
 from openviking.service.task_work_index import get_task_context
-from openviking_cli.exceptions import DeadlineExceededError
-from openviking_cli.session.user_id import UserIdentifier
 
 pytestmark = pytest.mark.asyncio
 
@@ -973,9 +973,7 @@ async def test_qualified_move_ack_keeps_refresh_work_tracked_without_waiting(mon
     from openviking.service.fs_service import FSService
 
     set_task_tracker(tracker)
-    service = FSService(
-        viking_fs=SimpleNamespace(_is_shared_resource_uri=lambda _uri: True)
-    )
+    service = FSService(viking_fs=SimpleNamespace(_is_shared_resource_uri=lambda _uri: True))
     entered = asyncio.Event()
     commit_allowed = asyncio.Event()
     state = {}
@@ -1009,9 +1007,7 @@ async def test_qualified_move_ack_keeps_refresh_work_tracked_without_waiting(mon
         assert task.status is TaskStatus.RUNNING
         assert task.error is None
     finally:
-        await tracker.mark_work_done(
-            state["task_id"], "parent-refresh", **_owner_kwargs()
-        )
+        await tracker.mark_work_done(state["task_id"], "parent-refresh", **_owner_kwargs())
         await asyncio.wait_for(running, timeout=1)
     terminal = await tracker.wait(state["task_id"], **_owner_kwargs(), timeout=0)
     assert terminal.status is TaskStatus.COMPLETED
