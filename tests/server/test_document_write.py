@@ -548,6 +548,8 @@ async def test_backup_sidecars_map_and_rollback_exact(admitted_service, monkeypa
         acl_mode=AclMode.RESTRICTED,
         ctx=ctx,
     )
+    relations = b'{"legacy": ["literal relation bytes"]}\n'
+    await fs.write_file_bytes(TARGET + "/.relations.json", relations, ctx=ctx)
     originals = {}
     for level, name in ((0, ".abstract.md"), (1, ".overview.md")):
         raw = render_abstract_overview(level, TARGET, "[old](" + TARGET + "/original.md)\n", {})
@@ -591,6 +593,9 @@ async def test_backup_sidecars_map_and_rollback_exact(admitted_service, monkeypa
     backup = (await document_node(service, BACKUP, ctx))["node"]
     assert backup == raised.value.details["retained_copies"][0]["node"]
     assert backup != before
+    assert await fs.read_file_bytes(TARGET + "/.relations.json", ctx=ctx) == relations
+    assert await fs.read_file_bytes(BACKUP + "/.relations.json", ctx=ctx) == relations
+    assert TARGET + "/.relations.json" in checked and BACKUP + "/.relations.json" in checked
     for level, name in ((0, ".abstract.md"), (1, ".overview.md")):
         assert await fs.read_file_bytes(TARGET + "/" + name, ctx=ctx) == originals[name]
         actual = await fs.read_file_bytes(BACKUP + "/" + name, ctx=ctx)
@@ -610,6 +615,46 @@ async def test_backup_sidecars_map_and_rollback_exact(admitted_service, monkeypa
         assert BACKUP + "/original.md" in parsed.body
         assert TARGET + "/original.md" not in parsed.body
         assert TARGET + "/" + name in checked and BACKUP + "/" + name in checked
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    ["/.relations.json", "/nested/.relations.json", "/.abstract.md", "/.overview.md"],
+)
+def test_snapshot_controls_are_not_direct_targets(service, suffix):
+    from openviking.service.document_write import _uri
+    from openviking.storage.resource_rfv import validate_resource_reindex_uri
+    from openviking_cli.exceptions import InvalidArgumentError
+
+    fs, ctx = service.viking_fs, _root_ctx()
+    uri = TARGET + suffix
+    assert _uri(fs, uri, ctx, generated=True) == uri
+    with pytest.raises(InvalidArgumentError):
+        _uri(fs, uri, ctx)
+    if suffix.endswith("/.relations.json"):
+        with pytest.raises(ValueError):
+            validate_resource_reindex_uri(fs, uri, ctx)
+
+
+@pytest.mark.parametrize(
+    "suffix", ["/.relations.json/child.md", "/../.relations.json", "/%2e/.relations.json"]
+)
+def test_snapshot_sidecar_does_not_relax_path_grammar(service, suffix):
+    from openviking.service.document_write import _uri
+    from openviking_cli.exceptions import InvalidArgumentError
+
+    with pytest.raises(InvalidArgumentError):
+        _uri(service.viking_fs, TARGET + suffix, _root_ctx(), generated=True)
+
+
+def test_snapshot_sidecar_requires_exact_storage_roundtrip(service, monkeypatch):
+    from openviking.service.document_write import _uri
+    from openviking_cli.exceptions import InvalidArgumentError
+
+    fs = service.viking_fs
+    monkeypatch.setattr(fs, "_path_to_uri", lambda *args, **kwargs: TARGET + "/other")
+    with pytest.raises(InvalidArgumentError):
+        _uri(fs, TARGET + "/.relations.json", _root_ctx(), generated=True)
 
 
 def test_closed_wire_shapes():

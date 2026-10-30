@@ -35,15 +35,20 @@ RESOURCE_REINDEX_INVENTORY_LIMIT = 384
 RESOURCE_REINDEX_ACTION_LIMIT = 384
 
 
-def validate_resource_reindex_uri(viking_fs, uri, ctx, *, target=None, is_dir=True):
+def _validate_resource_uri(
+    viking_fs, uri, ctx, *, target=None, is_dir=True, allow_relations_sidecar=False
+):
     """Reuse native resource grammar and exact storage identity; never normalize."""
     from openviking.service.resource_maintenance import validate_resource_target
 
     try:
         validate_resource_target(uri)
+        parts = uri.split("/")[3:]
         if len(uri.encode("utf-8")) > 1024 or any(
-            len(part.encode("utf-8")) > 255 or not part.isprintable() or part == ".relations.json"
-            for part in uri.split("/")[3:]
+            len(part.encode("utf-8")) > 255
+            or not part.isprintable()
+            or (part == ".relations.json" and (not allow_relations_sidecar or i != len(parts) - 1))
+            for i, part in enumerate(parts)
         ):
             raise ValueError()
         path = viking_fs._uri_to_path(uri, ctx=ctx)
@@ -53,6 +58,15 @@ def validate_resource_reindex_uri(viking_fs, uri, ctx, *, target=None, is_dir=Tr
             raise ValueError()
     except Exception:
         raise ValueError("Resource reindex requires canonical in-target URIs") from None
+
+
+def validate_resource_reindex_uri(viking_fs, uri, ctx, *, target=None, is_dir=True):
+    _validate_resource_uri(viking_fs, uri, ctx, target=target, is_dir=is_dir)
+
+
+def validate_resource_document_snapshot_uri(viking_fs, uri, ctx):
+    """Physical snapshots retain semantic sidecar bytes; these are not direct targets."""
+    _validate_resource_uri(viking_fs, uri, ctx, allow_relations_sidecar=True)
 
 
 def validate_resource_reindex_plan(viking_fs, snapshot, plan, ctx):

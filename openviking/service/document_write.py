@@ -43,7 +43,10 @@ from openviking.storage.queuefs import QueueManager
 from openviking.storage.queuefs.add_resource_msg import AddResourceMsg, AddResourcePhase
 from openviking.storage.queuefs.resource_embedding_fence import capture_resource_index_conditions
 from openviking.storage.resource_diff import build_rnfv_snapshot, prepare_artifact_inventory
-from openviking.storage.resource_rfv import validate_resource_reindex_uri
+from openviking.storage.resource_rfv import (
+    validate_resource_document_snapshot_uri,
+    validate_resource_reindex_uri,
+)
 from openviking.storage.resource_rnfv import CONTROL_BASENAMES, RequestIntent
 from openviking.storage.resource_target import AgfsResourceTarget
 from openviking.storage.vector_ids import vector_record_id
@@ -143,7 +146,10 @@ def _digest(value):
 
 def _uri(fs, uri, ctx, *, generated=False):
     try:
-        validate_resource_reindex_uri(fs, uri, ctx)
+        if generated:
+            validate_resource_document_snapshot_uri(fs, uri, ctx)
+        else:
+            validate_resource_reindex_uri(fs, uri, ctx)
         if not generated and any(part in CONTROL_BASENAMES for part in uri.split("/")[3:]):
             raise ValueError()
         if any(is_storage_internal_name(part) for part in uri.split("/")[3:]):
