@@ -1,10 +1,14 @@
 """Original-owner parent refresh after qualified native moves."""
 
+# Pytest fixture re-exports intentionally share names with test parameters.
+# ruff: noqa: F811
+
 import asyncio
 import json
 
 import pytest
 
+from openviking.service.task_tracker import TaskStatus, get_task_tracker
 from openviking.storage.queuefs.named_queue import NamedQueue
 from tests.server.conftest import service as service
 from tests.server.conftest import temp_dir as temp_dir
@@ -56,6 +60,13 @@ async def test_no_replace_move_refreshes_under_original_handoffs(
     detail = next(r for r in records if r.get("uri") == target and r.get("level") == 2)
     assert "team=move" in detail["search_tags"], detail
     assert not [r for r in records if r.get("uri") == source]
+    task_ids = {data["task_id"] for data in semantic}
+    assert len(task_ids) == 1
+    terminal = await get_task_tracker().wait(
+        task_ids.pop(), account_id=ctx.account_id, user_id=ctx.user.user_id, timeout=30
+    )
+    assert terminal.status is TaskStatus.COMPLETED
+    records = await _records(service, ctx)
     for parent in {source_parent, target_parent}:
         assert {(parent, 0), (parent, 1)}.issubset(
             {(r.get("uri"), r.get("level")) for r in records}
@@ -97,7 +108,6 @@ async def test_move_account_change_refuses_before_parent_metadata(admitted_servi
 
 async def test_move_caller_cancellation_finishes_parent_work(admitted_service, monkeypatch):
     from openviking.service.fs_service import FSService
-    from openviking.service.task_tracker import TaskStatus, get_task_tracker
 
     service = admitted_service
     ctx = _root_ctx()
@@ -129,9 +139,11 @@ async def test_move_caller_cancellation_finishes_parent_work(admitted_service, m
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(caller, 30)
     assert task_ids
-    task = await get_task_tracker().get(
-        task_ids[0], account_id=ctx.account_id, user_id=ctx.user.user_id
-    )
-    assert task.status is TaskStatus.COMPLETED
+    assert await service.viking_fs.read_file_bytes(target, ctx=ctx)
+    assert not await service.viking_fs.exists(source, ctx=ctx)
     records = await _records(service, ctx)
     assert (target, 2) in {(r.get("uri"), r.get("level")) for r in records}
+    task = await get_task_tracker().wait(
+        task_ids[0], account_id=ctx.account_id, user_id=ctx.user.user_id, timeout=30
+    )
+    assert task.status is TaskStatus.COMPLETED
