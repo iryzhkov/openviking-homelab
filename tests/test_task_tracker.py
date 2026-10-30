@@ -967,6 +967,56 @@ async def test_wait_timeout_excludes_operation_time_for_completed_task(tracker, 
     await asyncio.gather(*workers)
 
 
+async def test_qualified_move_ack_keeps_refresh_work_tracked_without_waiting(monkeypatch, tracker):
+    from types import SimpleNamespace
+
+    from openviking.service.fs_service import FSService
+
+    set_task_tracker(tracker)
+    service = FSService(
+        viking_fs=SimpleNamespace(_is_shared_resource_uri=lambda _uri: True)
+    )
+    entered = asyncio.Event()
+    commit_allowed = asyncio.Event()
+    state = {}
+
+    async def committed_move_and_dispatch(*_args, **_kwargs):
+        context = get_task_context()
+        state["task_id"] = context.task_id
+        entered.set()
+        await commit_allowed.wait()
+        await tracker.register_work(
+            context.task_id, "parent-refresh", "Semantic", **_owner_kwargs()
+        )
+        state["committed_and_dispatched"] = True
+
+    monkeypatch.setattr(service, "_mv_and_refresh", committed_move_and_dispatch)
+    running = asyncio.create_task(
+        service.mv(
+            "viking://resources/owned/source.md",
+            "viking://resources/owned/destination.md",
+            ctx=_make_ctx(),
+            no_replace=True,
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    assert not running.done()
+    commit_allowed.set()
+    try:
+        await asyncio.wait_for(asyncio.shield(running), timeout=0.5)
+        assert state["committed_and_dispatched"]
+        task = await tracker.get(state["task_id"], **_owner_kwargs())
+        assert task.status is TaskStatus.RUNNING
+        assert task.error is None
+    finally:
+        await tracker.mark_work_done(
+            state["task_id"], "parent-refresh", **_owner_kwargs()
+        )
+        await asyncio.wait_for(running, timeout=1)
+    terminal = await tracker.wait(state["task_id"], **_owner_kwargs(), timeout=0)
+    assert terminal.status is TaskStatus.COMPLETED
+
+
 async def test_multiple_queue_waits_share_budget_and_leave_task_pollable(tracker):
     set_task_tracker(tracker)
     state = {}

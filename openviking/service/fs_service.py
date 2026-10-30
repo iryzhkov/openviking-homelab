@@ -1224,7 +1224,9 @@ class FSService:
                     account_id=ctx.account_id,
                     user_id=ctx.user.user_id,
                     resource_id=to_uri,
-                    wait=True,
+                    # Acknowledge the committed move and durable refresh dispatch;
+                    # descendant Work remains tracked independently of this reply.
+                    wait=False,
                     operation=lambda: self._mv_and_refresh(
                         from_uri, to_uri, ctx=ctx, no_replace=no_replace
                     ),
