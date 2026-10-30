@@ -1,0 +1,87 @@
+{
+  "schema": "openviking-backend-candidate/v1",
+  "base": "ghcr.io/volcengine/openviking@sha256:2ae2799dac1e606218d9ffeb06af3b65c8218b3556555620a369ed81b7c5aa1f",
+  "base_config": "sha256:56a10cc7c1d32307877a2669a6d42b2eecd787ae1d6faf8d9e80d7737fefdcfa",
+  "base_origin": "7f3ae1af822d936c1d0b070537772b0f1d59122f",
+  "product": "71065c06ab5a1bc85ddc880166667fe1b00de423",
+  "product_tree": "7025f88e4a5c545b0b91235688cd56d22f17dab1",
+  "selection_sha256": "1f56e7d8aa6281ed49ca9ca1aed131515276fc8bd0ca70bcaffd66b5b60c6b86",
+  "product_count": 915,
+  "product_bytes": 10109896,
+  "native": {
+    "buildJobID": "54439712-1e8a-4b00-9bf5-594d57d21b2a",
+    "host": "agent-a",
+    "buildHarnessCommit": "d5752bcfc72038d95331adde75a6fa12618c8154",
+    "sha256": "8be7869a9f326ccd6cb67e093216f74296d1e98e93a73290918e6f33744ea1ad",
+    "bytes": 34413952,
+    "sourceCommit": "0ff04af959195ea3dd5f3c0e4314fc2209fd0053",
+    "sourceTree": "a96345436395f959bf4e5761ef8db7250628a1e7",
+    "sourceManifestSHA256": "3d0cae948ae8c18de8b8c653eca16f72ab5b6d0fbd2d4c0d19100494b781faee",
+    "buildExitCode": 0,
+    "overallOriginalJobExitCode": 1,
+    "originalFailure": "bare isolated import lacked openviking.storage.errors; no tests ran in original build job",
+    "parts": [
+      {
+        "path": "input/native-part-00",
+        "sha256": "e62d1977e9b7a42833a68472a37388b7983738f73aef17bbfdb9b6589b4f915c",
+        "bytes": 4194304
+      },
+      {
+        "path": "input/native-part-01",
+        "sha256": "7ee167b8becc74c8319f961d35735172f633e9a8a6baec849992fe202059af9d",
+        "bytes": 4194304
+      },
+      {
+        "path": "input/native-part-02",
+        "sha256": "5ddea582a236c8f139343b4836ec11e3a70548e150df67e38f05dab1a8496835",
+        "bytes": 4194304
+      },
+      {
+        "path": "input/native-part-03",
+        "sha256": "23729e9c8f3988639e4615411a327d6ba1204abaae56e39e9d7c5e2976b1139a",
+        "bytes": 4194304
+      },
+      {
+        "path": "input/native-part-04",
+        "sha256": "ca413a559a59d5687796747711cd6a23bdb25443c6162bb01a5876d22196985a",
+        "bytes": 4194304
+      },
+      {
+        "path": "input/native-part-05",
+        "sha256": "1a106d15330456b6857b30a317d077a7286f454c14c680a99e7a9961a17f30c1",
+        "bytes": 4194304
+      },
+      {
+        "path": "input/native-part-06",
+        "sha256": "c707c466259209620d32568c2bfef44815e3a9eb6b8ed0a2c3fd2d934a053505",
+        "bytes": 4194304
+      },
+      {
+        "path": "input/native-part-07",
+        "sha256": "aec8bb3301f1f5dae38f5ec9964231bbb673efb29847d791651672121503fd4f",
+        "bytes": 4194304
+      },
+      {
+        "path": "input/native-part-08",
+        "sha256": "6f6743aff4f2498a7f06941c7148043001188aef56914582fbad3147b5d3b628",
+        "bytes": 859520
+      }
+    ]
+  },
+  "crane": {
+    "url": "https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_x86_64.tar.gz",
+    "bytes": 16496784,
+    "sha256": "0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0"
+  },
+  "retained": {
+    "app/.venv/bin/openviking-server": "6ca655d2b5ddfc72103fbebae021ed792e3aa780036d65c821d72c1e0be4ef4c",
+    "app/.venv/lib/python3.13/site-packages/openviking/_version.py": "4355901a1bd13c1fcc3d993ea50a537714a89617b863b34b43c4875448297131",
+    "app/.venv/lib/python3.13/site-packages/openviking/bin/ov": "18bf052b58fffe27c5b56c470684ecf2d33caf63fd95fd2fde2f987ceda3db16",
+    "app/.venv/lib/python3.13/site-packages/openviking/storage/vectordb/engine/_x86_avx2.abi3.so": "5eaeafcce1085af3c2ed1d91cf8a5d6b8739abe157a023147dd5d1cffaa69841",
+    "app/.venv/lib/python3.13/site-packages/openviking/storage/vectordb/engine/_x86_avx512.abi3.so": "d6d6fe0b6f53bf014e5751c4c9c8d066c3454c632597a80424c178c050728290",
+    "app/.venv/lib/python3.13/site-packages/openviking/storage/vectordb/engine/_x86_caps.abi3.so": "5ab01b29856431f1fa2c11fbfb00d579fc10af7577fe72f7164c6234b96cf240",
+    "app/.venv/lib/python3.13/site-packages/openviking/storage/vectordb/engine/_x86_sse3.abi3.so": "90d599c9de0c5fd5da797e79770b3a84d41e0a245dba5f2c5b52f267267fe6ed",
+    "usr/local/bin/openviking-entrypoint": "45f9b5b0651e4a0c5ab16c8a9a54a82845a7a84d171bc2e0cd86ffa6080577f0",
+    "usr/local/bin/openviking-pending-health": "7653969440116d41414a400f41d6592faf324df1ece4dc14f27d505d64490139"
+  }
+}

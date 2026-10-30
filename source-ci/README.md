@@ -1,0 +1,13 @@
+# Focused source checks
+
+Run manually from the reviewed default-branch tooling revision. Root owns Actions settings, source publication, review and dispatch. The 32 inherited workflows stay byte-for-byte intact and must remain disabled individually before global Actions enablement. The root receipt `inherited-workflows-disabled.json` records their settings-only containment.
+
+The product pin for this locally prepared publication candidate is 71065c06ab5a1bc85ddc880166667fe1b00de423, tree 7025f88e4a5c545b0b91235688cd56d22f17dab1. Root owns final review acceptance and dispatch; this rebinding is not a source-CI result. The account-bound embedding native regressions remain separate agent-a evidence and are not added to the pure-filter workflow. The run-generated checkout identity records the actual tooling commit/tree and workflow separately. The static manifest records prior native byte evidence only. Git comparisons cover ragfs, ragfs-python and workspace Cargo inputs, not native reproducibility.
+
+`timeout -k 15 360 sh source-ci/run_checks.sh` asserts disk scratch HOME before writes, checks source identity before dependency acquisition, runs canonical Ruff 0.15.5 on the two selected product/test files, then runs nine pure filters twice. Pytest bypasses conftest, disables plugin autoload and inherited addopts, and loads pytest_asyncio explicitly. Each mode must have exact JUnit 9/0/0/0; export counts must be 9/0. Dependencies come from the pinned public image plus the inherited fixed package bundle. No entrypoint or native build runs.
+
+Evidence stays in the disposable workspace as `filter-results.tar.gz` and `filter-out/`. It includes checkout/inventory/input verification, scratch, dependency image/layers, installed supplemental distributions, Python/uv versions, logs, JUnit and collected/imported origins. The workflow prints the summary and checkout identity, uploads nothing, and cannot publish packages.
+
+For Chaldea, local Git selection prepares an index-tree attestation and a minimal regular-file snapshot. Remote validation checks the selected source bytes against that inventory. The inventory retains every tracked regular file and symlink link identity, Git mode and blob. Remote execution without .git leaves the hosted Git gate pending; it is not hosted CI.
+
+Harness origin and original blobs are in native-source-manifest.json. fetch_image.py, origin_plugin.py, run_checks.sh and base-manifest.sha256 derive from the prior isolated portability harness at 41fe2e3cec70dfe435498088dbd70a94659f7c24. Public network availability and packaged native imports remain dependencies. No store operation, binary rehash, reproducible build, OCI candidate or live service acceptance is claimed.
