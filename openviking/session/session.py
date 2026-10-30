@@ -728,7 +728,9 @@ class Session:
         try:
             if await self.exists():
                 return
-            await self._viking_fs.mkdir(self._session_uri, exist_ok=True, ctx=self.ctx)
+            await self._viking_fs.mkdir(
+                self._session_uri, exist_ok=True, ctx=self.ctx, lease_ref=lease
+            )
             await self._viking_fs.write_file(
                 f"{self._session_uri}/messages.jsonl",
                 "",

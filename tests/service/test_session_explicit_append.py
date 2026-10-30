@@ -39,9 +39,8 @@ def native(tmp_path, monkeypatch):
 
 
 async def provision(sessions, ctx, sid, *, enabled=False):
-    # Seed an existing native session directly. ensure_exists currently acquires
-    # its directory mutex then mkdir without passing the lease to native storage.
-    # That unrelated creation bug is outside this existing-only append contract.
+    # Isolate existing-session append cases. Real creation is covered separately
+    # in test_session_native_create.py without seeding directories or files.
     session = sessions.session(ctx, sid)
     await session._viking_fs.mkdir(session.uri, exist_ok=True, ctx=ctx)
     await session._viking_fs.write_file(session.uri + "/messages.jsonl", b"", ctx=ctx)
