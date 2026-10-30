@@ -10,6 +10,11 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Optional
 
+from openviking_cli.exceptions import InvalidArgumentError, NotFoundError, OpenVikingError
+from openviking_cli.utils import VikingURI, get_logger
+from openviking_cli.utils.config import get_openviking_config
+from openviking_cli.utils.config.embedding_config import SUMMARY_TEXT_SOURCES
+
 from openviking.config.vlm import VLMResolver
 from openviking.core.context import (
     Context,
@@ -27,7 +32,7 @@ from openviking.core.namespace import (
 )
 from openviking.core.namespace_policy import namespace_policy_for_uri
 from openviking.server.dependencies import get_service
-from openviking.server.identity import RequestContext
+from openviking.server.identity import RequestContext, Role
 from openviking.service.task_domain import TaskPatch
 from openviking.service.task_tracker import TaskStatus, get_task_tracker
 from openviking.service.task_work_index import bind_task_context, get_task_context
@@ -47,10 +52,6 @@ from openviking.utils.embedding_utils import (
     get_resource_content_type,
 )
 from openviking.utils.ingest_options import IngestOptions
-from openviking_cli.exceptions import InvalidArgumentError, NotFoundError, OpenVikingError
-from openviking_cli.utils import VikingURI, get_logger
-from openviking_cli.utils.config import get_openviking_config
-from openviking_cli.utils.config.embedding_config import SUMMARY_TEXT_SOURCES
 
 logger = get_logger(__name__)
 
@@ -931,6 +932,17 @@ class ReindexExecutor:
             )
         if _resource_uri(uri) and mode == "vectors_only":
             validate_resource_reindex_plan(service.viking_fs, snapshot, plan, run.ctx)
+            if run.ctx.role == Role.USER:
+                from openviking.storage.acl import AclAction
+
+                # Root permission alone does not authorize restricted children
+                # or orphan index rows. Validate the whole bounded plan before
+                # capturing conditions or enqueueing its first action.
+                await service.viking_fs._ensure_access_many(
+                    [uri, *(action.uri for action in plan.direct_index_actions)],
+                    run.ctx,
+                    action=AclAction.MANAGE,
+                )
         run.counters.scanned_records += len(snapshot.formal.entries)
         if plan.direct_index_actions:
             from openviking.storage.queuefs.resource_embedding_fence import (

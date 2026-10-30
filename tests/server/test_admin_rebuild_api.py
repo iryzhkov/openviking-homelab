@@ -6,12 +6,12 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from openviking_cli.exceptions import OpenVikingError, PermissionDeniedError
+from openviking_cli.session.user_id import UserIdentifier
 
 from openviking.core.context import ContextLevel
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.queuefs.process_result import ProcessResult
-from openviking_cli.exceptions import OpenVikingError, PermissionDeniedError
-from openviking_cli.session.user_id import UserIdentifier
 from tests.server.test_admin_api import ROOT_KEY
 from tests.server.test_admin_api import admin_app as _admin_app_fixture
 from tests.server.test_admin_api import admin_client as _admin_client_fixture
@@ -65,6 +65,10 @@ async def test_reindex_user_can_only_target_own_user_scope(monkeypatch):
     seen = {}
 
     class FakeService:
+        viking_fs = SimpleNamespace(
+            _ensure_access=AsyncMock(side_effect=PermissionDeniedError("manage denied"))
+        )
+
         async def reindex(self, *, uri, mode, wait, ctx):
             seen.update(uri=uri, mode=mode, wait=wait, ctx=ctx)
             return {"status": "completed", "uri": uri, "mode": mode}
@@ -1253,8 +1257,9 @@ async def test_reindex_memory_semantic_and_vectors_rebuilds_full_subtree(monkeyp
     ],
 )
 async def test_reindex_rejects_non_recursive_namespace_before_starting_work(monkeypatch, uri, wait):
-    from openviking.service.reindex_executor import ReindexExecutor
     from openviking_cli.exceptions import InvalidArgumentError
+
+    from openviking.service.reindex_executor import ReindexExecutor
 
     def unexpected_tracker():
         pytest.fail("unsupported non-recursive reindex must not start task tracking")
