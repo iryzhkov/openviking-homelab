@@ -7,6 +7,8 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import Response as FastAPIResponse
+from openviking_cli.exceptions import NotFoundError, PermissionDeniedError
+from openviking_cli.utils import get_logger
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openviking.core.namespace import (
@@ -28,11 +30,9 @@ from openviking.server.error_mapping import map_exception
 from openviking.server.identity import RequestContext, Role
 from openviking.server.models import Response
 from openviking.server.telemetry import run_operation
-from openviking.storage.acl import AclSpec
+from openviking.storage.acl import AclAction, AclSpec
 from openviking.storage.vector_ids import is_vector_record_id
 from openviking.telemetry import TelemetryRequest
-from openviking_cli.exceptions import NotFoundError, PermissionDeniedError
-from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
 
@@ -121,12 +121,16 @@ class ReindexRequest(BaseModel):
 router = APIRouter(prefix="/api/v1/content", tags=["content"])
 
 
-def _authorize_reindex_uri(uri: str, ctx: RequestContext) -> str:
-    """Allow users to reindex only their own private namespace."""
+def _authorize_reindex_uri(
+    uri: str, ctx: RequestContext, *, resource_vectors_only: bool = False
+) -> str:
+    """Keep private ownership checks; resources additionally require management ACLs."""
     if ctx.role != Role.USER:
         return uri
 
     target = resolve_uri(uri)
+    if resource_vectors_only and target.scope == "resources":
+        return uri
     if (
         target.scope != "user"
         or target.owner_user_id != ctx.user.user_id
@@ -355,8 +359,16 @@ async def reindex(
 ):
     """Reindex semantic/vector artifacts for a URI-scoped maintenance target."""
     uri = validate_request_viking_uri(resolve_path_variables(body.uri), ctx)
-    uri = _authorize_reindex_uri(uri, ctx)
+    resource_vectors_only = (
+        body.mode == "vectors_only" and body.tags is None and body.tag_mode == "replace"
+    )
+    uri = _authorize_reindex_uri(uri, ctx, resource_vectors_only=resource_vectors_only)
     service = get_service()
+    if ctx.role == Role.USER and resolve_uri(uri).scope == "resources":
+        # Before task creation. Every planned effect is checked again under the
+        # original resource lease in the executor, including index-only rows.
+        await service.viking_fs._ensure_access(uri, ctx, action=AclAction.READ)
+        await service.viking_fs._ensure_access(uri, ctx, action=AclAction.MANAGE)
     reindex_kwargs = {
         "uri": uri,
         "mode": body.mode,
