@@ -3,15 +3,15 @@
 import asyncio
 
 import pytest
-
 from openviking.config.embedding import AccountBoundEmbedder
 from openviking.server.auth import get_request_context
 from openviking.server.identity import RequestContext, Role
-from openviking.service.document_write import DocumentWriteRequest, document_node, write_document
 from openviking.storage.acl import AclMode
 from openviking.utils.media_processor import UnifiedResourceProcessor
 from openviking_cli.exceptions import ConflictError, OpenVikingError, PermissionDeniedError
 from openviking_cli.session.user_id import UserIdentifier
+
+from openviking.service.document_write import DocumentWriteRequest, document_node, write_document
 from tests.server import conftest as server_fixtures
 from tests.server import test_real_resource_producer_e2e as producer_fixtures
 
@@ -362,9 +362,10 @@ async def test_stale_controls_and_same_process_rollback(admitted_service, monkey
 
 
 async def test_conflicting_acl_refuses_before_private_preparation(admitted_service, monkeypatch):
-    from openviking.service import document_write
     from openviking.storage.vector_ids import vector_record_id
     from openviking_cli.exceptions import FailedPreconditionError
+
+    from openviking.service import document_write
 
     service = admitted_service
     fs = service.viking_fs
@@ -547,8 +548,9 @@ async def test_document_node_hides_denied_descendant(
 
 
 async def test_duplicate_slot_controls_refuse_before_effects(admitted_service, monkeypatch):
-    from openviking.service import document_write
     from openviking_cli.exceptions import FailedPreconditionError
+
+    from openviking.service import document_write
 
     service, ctx = admitted_service, _root_ctx()
     fs = service.viking_fs
@@ -595,12 +597,13 @@ async def test_duplicate_slot_controls_refuse_before_effects(admitted_service, m
 
 
 async def test_backup_sidecars_map_and_rollback_exact(admitted_service, monkeypatch):
-    from openviking.service import document_write
     from openviking.storage.abstract_overview import (
         parse_abstract_overview,
         render_abstract_overview,
         rewrite_abstract_overview_for_transfer,
     )
+
+    from openviking.service import document_write
 
     service, ctx = admitted_service, _root_ctx()
     fs = service.viking_fs
@@ -690,9 +693,10 @@ async def test_backup_sidecars_map_and_rollback_exact(admitted_service, monkeypa
     ["/.relations.json", "/nested/.relations.json", "/.abstract.md", "/.overview.md"],
 )
 def test_snapshot_controls_are_not_direct_targets(service, suffix):
-    from openviking.service.document_write import _uri
     from openviking.storage.resource_rfv import validate_resource_reindex_uri
     from openviking_cli.exceptions import InvalidArgumentError
+
+    from openviking.service.document_write import _uri
 
     fs, ctx = service.viking_fs, _root_ctx()
     uri = TARGET + suffix
@@ -708,16 +712,18 @@ def test_snapshot_controls_are_not_direct_targets(service, suffix):
     "suffix", ["/.relations.json/child.md", "/../.relations.json", "/%2e/.relations.json"]
 )
 def test_snapshot_sidecar_does_not_relax_path_grammar(service, suffix):
-    from openviking.service.document_write import _uri
     from openviking_cli.exceptions import InvalidArgumentError
+
+    from openviking.service.document_write import _uri
 
     with pytest.raises(InvalidArgumentError):
         _uri(service.viking_fs, TARGET + suffix, _root_ctx(), generated=True)
 
 
 def test_snapshot_sidecar_requires_exact_storage_roundtrip(service, monkeypatch):
-    from openviking.service.document_write import _uri
     from openviking_cli.exceptions import InvalidArgumentError
+
+    from openviking.service.document_write import _uri
 
     fs = service.viking_fs
     monkeypatch.setattr(fs, "_path_to_uri", lambda *args, **kwargs: TARGET + "/other")
@@ -747,6 +753,7 @@ def test_closed_wire_shapes():
 @pytest.mark.parametrize("phase", ["capture", "enqueue"])
 async def test_verified_ack_retains_transaction(admitted_service, monkeypatch, phase):
     from pathlib import Path
+
     from openviking.service import document_write as module
 
     service = admitted_service
@@ -986,6 +993,7 @@ async def test_second_write_excluded_until_continuation(admitted_service, monkey
 
     service = admitted_service
     ctx = _root_ctx()
+    expected = await seed_file(service)
     entered, release = asyncio.Event(), asyncio.Event()
     original = service.resources._enqueue_add_resource_job
     calls = []
@@ -998,14 +1006,30 @@ async def test_second_write_excluded_until_continuation(admitted_service, monkey
         return await original(*args, **kwargs)
 
     monkeypatch.setattr(service.resources, "_enqueue_add_resource_job", gated)
-    first = await asyncio.wait_for(write_document(service, DocumentWriteRequest(
-        target_uri=TARGET, source_name="note.txt", text="first body",
-        reason=HINT, expected={"kind": "absent"}, representation="raw_file",
-    ), ctx), 20)
+    first = await asyncio.wait_for(
+        write_document(
+            service,
+            DocumentWriteRequest(
+                target_uri=TARGET,
+                source_name="note.txt",
+                text="first body",
+                reason=HINT,
+                expected=expected,
+                representation="raw_file",
+            ),
+            ctx,
+        ),
+        20,
+    )
     await asyncio.wait_for(entered.wait(), 5)
     request = DocumentWriteRequest(
-        target_uri=TARGET, source_name="note.txt", text="second body",
-        reason=HINT, expected=first["node"], backup_uri=BACKUP, representation="raw_file",
+        target_uri=TARGET,
+        source_name="note.txt",
+        text="second body",
+        reason=HINT,
+        expected=first["node"],
+        backup_uri=BACKUP,
+        representation="raw_file",
     )
     try:
         # Native account coverage fails fast rather than queueing another lease.
@@ -1025,6 +1049,7 @@ async def test_second_write_excluded_until_continuation(admitted_service, monkey
 async def test_after_ack_context_failure_observed_once(admitted_service, monkeypatch):
     from contextlib import asynccontextmanager
     from unittest.mock import Mock
+
     from openviking.service import fs_service as fs_module
 
     service = admitted_service
@@ -1086,6 +1111,7 @@ async def test_after_ack_context_failure_observed_once(admitted_service, monkeyp
 @pytest.mark.parametrize("phase", ["capture", "enqueue"])
 async def test_after_ack_caught_postcommit_failure(admitted_service, monkeypatch, phase):
     from unittest.mock import Mock
+
     from openviking.service import document_write as module
 
     service = admitted_service
@@ -1156,6 +1182,7 @@ async def test_document_capacity_held_until_transaction_done(
     admitted_service, monkeypatch, recwarn, cancel_waiter
 ):
     import gc
+
     from openviking.service import document_write as module
 
     service = admitted_service

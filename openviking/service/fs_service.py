@@ -13,17 +13,6 @@ from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional
 
-from openviking_cli.exceptions import (
-    DeadlineExceededError,
-    InvalidArgumentError,
-    NotFoundError,
-    NotInitializedError,
-    PermissionDeniedError,
-    ResourceExhaustedError,
-)
-from openviking_cli.utils import VikingURI, get_logger
-from openviking_cli.utils.config import get_openviking_config
-
 from openviking.core.context import ContextLevel
 from openviking.core.namespace import (
     canonical_session_root,
@@ -44,7 +33,6 @@ from openviking.privacy.skill_restore import get_skill_name_from_uri, restore_sk
 from openviking.resource.uri_mutation_coordinator import UriMutationCoordinator
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
-from openviking.service import tree_replace
 from openviking.service.task_tracker import get_task_tracker, run_tracked_operation
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.service.task_work_index import get_enqueued_work_ids, get_task_context
@@ -74,6 +62,18 @@ from openviking.utils.embedding_utils import vectorize_directory_meta
 from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.path_safety import validate_safe_viking_uri_path
 from openviking.utils.tags import normalize_search_tags
+from openviking_cli.exceptions import (
+    DeadlineExceededError,
+    InvalidArgumentError,
+    NotFoundError,
+    NotInitializedError,
+    PermissionDeniedError,
+    ResourceExhaustedError,
+)
+from openviking_cli.utils import VikingURI, get_logger
+from openviking_cli.utils.config import get_openviking_config
+
+from openviking.service import tree_replace
 
 logger = get_logger(__name__)
 
@@ -650,9 +650,8 @@ class FSService:
         Never writes watch or Task state. The error names no watch, owner,
         Task or source.
         """
-        from openviking_cli.exceptions import ConflictError, FailedPreconditionError
-
         from openviking.resource.uri_mutation_coordinator import uri_matches_prefix
+        from openviking_cli.exceptions import ConflictError, FailedPreconditionError
 
         targets = [uri.rstrip("/") for uri in uris if uri]
 

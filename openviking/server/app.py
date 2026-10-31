@@ -13,9 +13,6 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
-from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.middleware.exceptions import ExceptionMiddleware
-
 from openviking.observability.http_error_context import capture_public_http_error
 from openviking.server.config import (
     ServerConfig,
@@ -59,7 +56,6 @@ from openviking.server.routers import (
     webdav_router,
 )
 from openviking.server.timing_middleware import RequestTimingMiddleware
-from openviking.service.core import OpenVikingService
 from openviking.service.task_tracker import get_task_tracker
 from openviking_cli.exceptions import OpenVikingError
 from openviking_cli.utils import get_logger
@@ -71,6 +67,10 @@ from openviking_cli.utils.config import (
 )
 from openviking_cli.utils.logger import init_otel_log_handler_from_server_config
 from openviking_gateway.config import MOUNT_PATH as GATEWAY_MOUNT_PATH
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.exceptions import ExceptionMiddleware
+
+from openviking.service.core import OpenVikingService
 
 logger = get_logger(__name__)
 
@@ -675,9 +675,8 @@ def create_app(
         if ov_cfg.oauth.enabled:
             from mcp.server.auth.routes import create_auth_routes
             from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
-            from pydantic import AnyHttpUrl
-
             from openviking.server.oauth.router import router as oauth_router
+            from pydantic import AnyHttpUrl
 
             # Custom routes (authorize page + consent / verify endpoints).
             app.include_router(oauth_router)

@@ -26,13 +26,13 @@ uv --version > "$out/uv.txt"
 python3 -I - <<'PY'
 import ast,hashlib,json,pathlib
 expected={
-"openviking/service/fs_service.py":"9498f6239c18f253dce3cd319a9ada3e8183eace",
+"openviking/service/fs_service.py":"3662cdac44c238679beb4579f2bc7afc8314c20b",
 "openviking/service/core.py":"87b3def9fb6f8f784356da52f401a9a99fa4836a",
-"openviking/server/app.py":"de017f86ac0094ff7dd5c021cf0c901417a82d28",
+"openviking/server/app.py":"fa35348d879c317fd94d91bab056649ea3acab35",
 "openviking/storage/resource_rfv.py":"9b717ca45d1ec28656c0a529a8d91915030adbe2",
 "openviking/service/document_write.py":"0089a6e1067b237b23871efab593a518096e2e18",
 "openviking/server/routers/resources.py":"6ea192d7bb1d61bdf7dd63af14e9d0d845e3a42b",
-"tests/server/test_document_write.py":"069fe1ee8da9b15273f5118668c53f3d90f92b8d",
+"tests/server/test_document_write.py":"a32776fb4a19c49d735523361dcefc61c67c5732",
 "tests/server/test_reindex_effect_bounds_e2e.py":"2b1dd889fae1c62eae141c1e586f12a7c5d00bbd"}
 rows={}
 for name,blob in expected.items():

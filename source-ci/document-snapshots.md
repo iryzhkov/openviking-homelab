@@ -43,9 +43,10 @@ The added event-gated cases require the actual enqueue/capture functions after
 their gates, with native queue/tracker methods unpatched. They cover ownership,
 readable bytes and backup, cleanup, precommit failure, cancellation, shutdown
 ordering, ASGI response delivery, serialization, caught and escaping postcommit
-failures, and the completed-task race. These new cases are pending validation:
-the first Chaldea submission failed locally during snapshot creation with ELOOP.
-The updated 35/30 report gate is a required acceptance target, not a passing claim.
+failures, the completed-task race, capacity held after ACK, and cancellable admission
+without transaction creation or mutation. The report gate requires exactly 35/30
+passing cases. Validation receipts record actual outcomes and source bindings;
+source pins alone do not establish a passing run.
 
 This change addresses the source-proven postcommit delay class only. The incident
 cause remains unproven; the existing hold and paused job remain untouched.
