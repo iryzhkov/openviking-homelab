@@ -413,7 +413,11 @@ def create_app(
                 from openviking_gateway.app import seed_defaults
 
                 await seed_defaults(gateway, "default")
-            yield
+            try:
+                yield
+            finally:
+                if service is not None:
+                    await service.fs.drain_acked_transactions()
 
         # Cleanup
         from openviking.metrics.global_api import shutdown_metrics_async

@@ -13,17 +13,6 @@ from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional
 
-from openviking_cli.exceptions import (
-    DeadlineExceededError,
-    InvalidArgumentError,
-    NotFoundError,
-    NotInitializedError,
-    PermissionDeniedError,
-    ResourceExhaustedError,
-)
-from openviking_cli.utils import VikingURI, get_logger
-from openviking_cli.utils.config import get_openviking_config
-
 from openviking.core.context import ContextLevel
 from openviking.core.namespace import (
     canonical_session_root,
@@ -74,6 +63,16 @@ from openviking.utils.embedding_utils import vectorize_directory_meta
 from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.path_safety import validate_safe_viking_uri_path
 from openviking.utils.tags import normalize_search_tags
+from openviking_cli.exceptions import (
+    DeadlineExceededError,
+    InvalidArgumentError,
+    NotFoundError,
+    NotInitializedError,
+    PermissionDeniedError,
+    ResourceExhaustedError,
+)
+from openviking_cli.utils import VikingURI, get_logger
+from openviking_cli.utils.config import get_openviking_config
 
 logger = get_logger(__name__)
 
@@ -131,6 +130,9 @@ class FSService:
         self._uri_mutation_coordinator = uri_mutation_coordinator or UriMutationCoordinator()
         # Installed by OpenVikingService; records Compile output versions after writes.
         self.compile_versions: Optional[Any] = None
+        # Own document continuations through lease handoff and context cleanup.
+        self._acked_transactions: set[asyncio.Task] = set()
+        self._document_transactions = asyncio.BoundedSemaphore(32)
 
     def set_dependencies(
         self,
@@ -647,9 +649,8 @@ class FSService:
         Never writes watch or Task state. The error names no watch, owner,
         Task or source.
         """
-        from openviking_cli.exceptions import ConflictError, FailedPreconditionError
-
         from openviking.resource.uri_mutation_coordinator import uri_matches_prefix
+        from openviking_cli.exceptions import ConflictError, FailedPreconditionError
 
         targets = [uri.rstrip("/") for uri in uris if uri]
 
@@ -1568,6 +1569,75 @@ class FSService:
                 )
             finally:
                 await viking_fs._async_agfs.pathlock_release(lease)
+
+    async def _finish_transfer_after_verified_ack(
+        self,
+        transaction: Callable[[], Coroutine[Any, Any, Any]],
+        verified: asyncio.Future,
+        *,
+        operation: str,
+    ) -> Any:
+        """Bound owned transactions until done, including after a verified ACK."""
+        await self._document_transactions.acquire()
+        try:
+            task = asyncio.create_task(transaction())
+        except BaseException:
+            self._document_transactions.release()
+            raise
+        self._acked_transactions.add(task)
+        ack_delivered = False
+
+        def completed(done):
+            self._acked_transactions.discard(done)
+            self._document_transactions.release()
+            if ack_delivered and not done.cancelled():
+                failure = done.exception()
+                if failure is not None:
+                    # Exception text/tracebacks can contain document URIs or bodies.
+                    logger.error(
+                        "Filesystem %s continuation failed: %s",
+                        operation,
+                        type(failure).__name__,
+                    )
+
+        task.add_done_callback(completed)
+        try:
+            await asyncio.wait({task, verified}, return_when=asyncio.FIRST_COMPLETED)
+            if task.done():
+                return task.result()
+            ack_delivered = True
+            return verified.result()
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not task.cancelled():
+                failure = task.exception()
+                if failure is not None:
+                    logger.error(
+                        "Filesystem %s cancelled transaction failed: %s",
+                        operation,
+                        type(failure).__name__,
+                    )
+            raise
+
+    async def drain_acked_transactions(self) -> None:
+        """Finish owned transactions before closing any of their dependencies."""
+        cancelled = False
+        while self._acked_transactions:
+            pending = asyncio.gather(*self._acked_transactions, return_exceptions=True)
+            # Cancellation of shutdown must not cancel a suspect enqueue.
+            while not pending.done():
+                try:
+                    await asyncio.shield(pending)
+                except asyncio.CancelledError:
+                    cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _finish_transfer_after_caller_cancel(
         self,
