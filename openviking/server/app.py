@@ -675,8 +675,9 @@ def create_app(
         if ov_cfg.oauth.enabled:
             from mcp.server.auth.routes import create_auth_routes
             from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
-            from openviking.server.oauth.router import router as oauth_router
             from pydantic import AnyHttpUrl
+
+            from openviking.server.oauth.router import router as oauth_router
 
             # Custom routes (authorize page + consent / verify endpoints).
             app.include_router(oauth_router)

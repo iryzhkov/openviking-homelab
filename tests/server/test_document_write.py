@@ -362,10 +362,9 @@ async def test_stale_controls_and_same_process_rollback(admitted_service, monkey
 
 
 async def test_conflicting_acl_refuses_before_private_preparation(admitted_service, monkeypatch):
+    from openviking.service import document_write
     from openviking.storage.vector_ids import vector_record_id
     from openviking_cli.exceptions import FailedPreconditionError
-
-    from openviking.service import document_write
 
     service = admitted_service
     fs = service.viking_fs
@@ -548,9 +547,8 @@ async def test_document_node_hides_denied_descendant(
 
 
 async def test_duplicate_slot_controls_refuse_before_effects(admitted_service, monkeypatch):
-    from openviking_cli.exceptions import FailedPreconditionError
-
     from openviking.service import document_write
+    from openviking_cli.exceptions import FailedPreconditionError
 
     service, ctx = admitted_service, _root_ctx()
     fs = service.viking_fs
@@ -597,13 +595,12 @@ async def test_duplicate_slot_controls_refuse_before_effects(admitted_service, m
 
 
 async def test_backup_sidecars_map_and_rollback_exact(admitted_service, monkeypatch):
+    from openviking.service import document_write
     from openviking.storage.abstract_overview import (
         parse_abstract_overview,
         render_abstract_overview,
         rewrite_abstract_overview_for_transfer,
     )
-
-    from openviking.service import document_write
 
     service, ctx = admitted_service, _root_ctx()
     fs = service.viking_fs
@@ -693,10 +690,9 @@ async def test_backup_sidecars_map_and_rollback_exact(admitted_service, monkeypa
     ["/.relations.json", "/nested/.relations.json", "/.abstract.md", "/.overview.md"],
 )
 def test_snapshot_controls_are_not_direct_targets(service, suffix):
+    from openviking.service.document_write import _uri
     from openviking.storage.resource_rfv import validate_resource_reindex_uri
     from openviking_cli.exceptions import InvalidArgumentError
-
-    from openviking.service.document_write import _uri
 
     fs, ctx = service.viking_fs, _root_ctx()
     uri = TARGET + suffix
@@ -712,18 +708,16 @@ def test_snapshot_controls_are_not_direct_targets(service, suffix):
     "suffix", ["/.relations.json/child.md", "/../.relations.json", "/%2e/.relations.json"]
 )
 def test_snapshot_sidecar_does_not_relax_path_grammar(service, suffix):
-    from openviking_cli.exceptions import InvalidArgumentError
-
     from openviking.service.document_write import _uri
+    from openviking_cli.exceptions import InvalidArgumentError
 
     with pytest.raises(InvalidArgumentError):
         _uri(service.viking_fs, TARGET + suffix, _root_ctx(), generated=True)
 
 
 def test_snapshot_sidecar_requires_exact_storage_roundtrip(service, monkeypatch):
-    from openviking_cli.exceptions import InvalidArgumentError
-
     from openviking.service.document_write import _uri
+    from openviking_cli.exceptions import InvalidArgumentError
 
     fs = service.viking_fs
     monkeypatch.setattr(fs, "_path_to_uri", lambda *args, **kwargs: TARGET + "/other")

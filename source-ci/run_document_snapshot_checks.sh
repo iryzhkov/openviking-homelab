@@ -28,11 +28,11 @@ import ast,hashlib,json,pathlib
 expected={
 "openviking/service/fs_service.py":"f4faad8c161098a82182c00edae33d097df40175",
 "openviking/service/core.py":"87b3def9fb6f8f784356da52f401a9a99fa4836a",
-"openviking/server/app.py":"1c160b0763aa814e806bba4da0924932fe5d28f1",
+"openviking/server/app.py":"de017f86ac0094ff7dd5c021cf0c901417a82d28",
 "openviking/storage/resource_rfv.py":"9b717ca45d1ec28656c0a529a8d91915030adbe2",
 "openviking/service/document_write.py":"0089a6e1067b237b23871efab593a518096e2e18",
 "openviking/server/routers/resources.py":"6ea192d7bb1d61bdf7dd63af14e9d0d845e3a42b",
-"tests/server/test_document_write.py":"406b2665e47f950ee3804a1b0d5a5917cc164991",
+"tests/server/test_document_write.py":"390a19074461ffb9b58a2d1509a1d84c53835e49",
 "tests/server/test_reindex_effect_bounds_e2e.py":"2b1dd889fae1c62eae141c1e586f12a7c5d00bbd"}
 rows={}
 for name,blob in expected.items():
