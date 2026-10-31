@@ -44,7 +44,9 @@ jobs:
         shell: bash
         run: |
           cd "$GITHUB_WORKSPACE/.cache/document-snapshot-ci/source"
+          python3 -I -m unittest discover -s source-ci -p test_document_snapshot_reports.py
           timeout -k 5 780 sh source-ci/run_document_snapshot_checks.sh
+          python3 -I source-ci/check_document_snapshot_reports.py relations-out
       - name: Report bounded test evidence
         if: always()
         shell: bash
