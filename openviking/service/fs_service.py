@@ -133,6 +133,7 @@ class FSService:
         self.compile_versions: Optional[Any] = None
         # Own document continuations through lease handoff and context cleanup.
         self._acked_transactions: set[asyncio.Task] = set()
+        self._document_transactions = asyncio.BoundedSemaphore(32)
 
     def set_dependencies(
         self,
@@ -1573,18 +1574,24 @@ class FSService:
 
     async def _finish_transfer_after_verified_ack(
         self,
-        transaction: Coroutine[Any, Any, Any],
+        transaction: Callable[[], Coroutine[Any, Any, Any]],
         verified: asyncio.Future,
         *,
         operation: str,
     ) -> Any:
-        """Return verified bytes while the same owned transaction finishes."""
-        task = asyncio.create_task(transaction)
+        """Bound owned transactions until done, including after a verified ACK."""
+        await self._document_transactions.acquire()
+        try:
+            task = asyncio.create_task(transaction())
+        except BaseException:
+            self._document_transactions.release()
+            raise
         self._acked_transactions.add(task)
         ack_delivered = False
 
         def completed(done):
             self._acked_transactions.discard(done)
+            self._document_transactions.release()
             if ack_delivered and not done.cancelled():
                 failure = done.exception()
                 if failure is not None:

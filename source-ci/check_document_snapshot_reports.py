@@ -8,7 +8,7 @@ from xml.etree import ElementTree
 
 def check_reports(directory):
     counts = {}
-    for name, expected in (("document", 33), ("reindex", 30)):
+    for name, expected in (("document", 35), ("reindex", 30)):
         path = directory / (name + "-junit.xml")
         root = ElementTree.parse(path).getroot()
         suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))

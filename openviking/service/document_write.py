@@ -594,7 +594,7 @@ async def write_document(service, request, ctx, *, fault=None):
         return await _write_document(service, request, ctx, fault=fault, on_verified=verified)
 
     return await service.fs._finish_transfer_after_verified_ack(
-        run(), verified, operation="document-write"
+        run, verified, operation="document-write"
     )
 
 

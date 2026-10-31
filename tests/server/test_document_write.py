@@ -1074,7 +1074,88 @@ async def test_verified_ack_prefers_finished_result(admitted_service):
         return {"cleanup_state": "complete", "processing_state": "accepted"}
 
     result = await service.fs._finish_transfer_after_verified_ack(
-        transaction(), verified, operation="document-write",
+        transaction, verified, operation="document-write",
     )
     assert result == {"cleanup_state": "complete", "processing_state": "accepted"}
     assert not service.fs._acked_transactions
+
+
+@pytest.mark.parametrize("cancel_waiter", [False, True])
+async def test_document_capacity_held_until_transaction_done(
+    admitted_service, monkeypatch, recwarn, cancel_waiter
+):
+    import gc
+    from openviking.service import document_write as module
+
+    service = admitted_service
+    ctx = _root_ctx()
+    capacity = asyncio.BoundedSemaphore(1)
+    monkeypatch.setattr(service.fs, "_document_transactions", capacity)
+    entered, release, attempted = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original_enqueue = service.resources._enqueue_add_resource_job
+    original_write = module._write_document
+    started = []
+
+    async def observed(*args, **kwargs):
+        started.append(args[1].target_uri)
+        return await original_write(*args, **kwargs)
+
+    async def gated(*args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            await release.wait()
+        return await original_enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_write_document", observed)
+    monkeypatch.setattr(service.resources, "_enqueue_add_resource_job", gated)
+    second_uri = BASE + "/second.md"
+
+    async def second_call():
+        attempted.set()
+        return await write_document(service, DocumentWriteRequest(
+            target_uri=second_uri, source_name="second.md", text="second body",
+            reason=HINT, expected={"kind": "absent"},
+        ), ctx)
+
+    second = None
+    try:
+        ack = await asyncio.wait_for(write_document(service, DocumentWriteRequest(
+            target_uri=TARGET, source_name="note.md", text="first body",
+            reason=HINT, expected={"kind": "absent"},
+        ), ctx), 20)
+        await asyncio.wait_for(entered.wait(), 5)
+        assert ack["content_state"] == "committed"
+        assert ack["cleanup_state"] == "unknown"
+        second = asyncio.create_task(second_call())
+        await asyncio.wait_for(attempted.wait(), 5)
+        assert not second.done()
+        assert started == [TARGET]
+        assert len(service.fs._acked_transactions) == 1
+        assert (await document_node(service, second_uri, ctx))["node"]["kind"] == "absent"
+        if cancel_waiter:
+            second.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(second, 5)
+            assert started == [TARGET]
+            assert len(service.fs._acked_transactions) == 1
+            gc.collect()
+            assert not [w for w in recwarn if "was never awaited" in str(w.message)]
+        release.set()
+        if not cancel_waiter:
+            result = await asyncio.wait_for(second, 20)
+            assert result["content_state"] == "committed"
+            assert started == [TARGET, second_uri]
+    finally:
+        release.set()
+        if second is not None and not second.done():
+            await asyncio.wait_for(second, 20)
+        await settle(service)
+    assert not service.fs._acked_transactions
+    # The one permit returns exactly once, after the callback, even after ACK.
+    await asyncio.wait_for(capacity.acquire(), 5)
+    assert capacity.locked()
+    capacity.release()
+    if cancel_waiter:
+        assert (await document_node(service, second_uri, ctx))["node"]["kind"] == "absent"
+        gc.collect()
+        assert not [w for w in recwarn if "was never awaited" in str(w.message)]
