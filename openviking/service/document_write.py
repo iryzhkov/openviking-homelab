@@ -5,6 +5,7 @@ No import/watch controls and no persisted journal. Rollback is same-process only
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -60,6 +61,7 @@ from openviking_cli.exceptions import (
     PermissionDeniedError,
     ResourceExhaustedError,
 )
+from openviking_cli.utils import get_logger
 from openviking_cli.utils.config import get_openviking_config
 
 MAX_TEXT_BYTES = 1024 * 1024
@@ -586,13 +588,17 @@ async def _clear_body(fs, uri, old, ctx, lease):
 async def write_document(service, request, ctx, *, fault=None):
     """Own admission, private artifact, verified backup and final queue handoff."""
 
+    verified = asyncio.get_running_loop().create_future()
+
     async def run():
-        return await _write_document(service, request, ctx, fault=fault)
+        return await _write_document(service, request, ctx, fault=fault, on_verified=verified)
 
-    return await service.fs._finish_transfer_after_caller_cancel(run(), operation="document-write")
+    return await service.fs._finish_transfer_after_verified_ack(
+        run(), verified, operation="document-write"
+    )
 
 
-async def _write_document(service, request, ctx, *, fault):
+async def _write_document(service, request, ctx, *, fault, on_verified=None):
     fs, uri = service.viking_fs, request.target_uri
     _uri(fs, uri, ctx)
     uris = [uri]
@@ -825,6 +831,8 @@ async def _write_document(service, request, ctx, *, fault):
                     "backup": {"uri": request.backup_uri, "node": backup.node} if backup else None,
                     "cleanup_state": "complete",
                 }
+                if on_verified is not None and not on_verified.done():
+                    on_verified.set_result(deepcopy({**result, "cleanup_state": "unknown"}))
                 try:
                     conditions = await capture_resource_index_conditions(
                         plan.direct_index_actions, ctx, admitted, lease
@@ -873,7 +881,10 @@ async def _write_document(service, request, ctx, *, fault):
                         msg, queue_name=QueueManager.ADD_RESOURCE, resource_lock=enqueue_lease
                     )
                     result["processing_state"] = "accepted"
-                except Exception:
+                except Exception as failure:
+                    get_logger(__name__).error(
+                        "Document postcommit continuation failed: %s", type(failure).__name__
+                    )
                     result["processing_state"] = "unobserved"
                 return result
     except Exception as failure:

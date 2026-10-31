@@ -14,7 +14,7 @@ class ReportGateTests(unittest.TestCase):
         self.scratch = tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"])
         self.addCleanup(self.scratch.cleanup)
         self.directory = Path(self.scratch.name)
-        for name, count in (("document", 21), ("reindex", 30)):
+        for name, count in (("document", 33), ("reindex", 30)):
             root = ElementTree.Element("testsuites")
             suite = ElementTree.SubElement(
                 root, "testsuite", tests=str(count), errors="0", failures="0", skipped="0"
@@ -24,7 +24,7 @@ class ReportGateTests(unittest.TestCase):
             ElementTree.ElementTree(root).write(self.directory / (name + "-junit.xml"))
 
     def test_complete_passing_reports(self):
-        self.assertEqual(check_reports(self.directory), {"document": 21, "reindex": 30})
+        self.assertEqual(check_reports(self.directory), {"document": 33, "reindex": 30})
 
     def test_nonpassing_cases_refuse_even_with_zero_summary(self):
         for tag, attributes in (
@@ -45,7 +45,7 @@ class ReportGateTests(unittest.TestCase):
                 case.remove(child)
                 root.write(path)
 
-    def test_twenty_document_cases_refuse(self):
+    def test_missing_document_case_refuses(self):
         path = self.directory / "document-junit.xml"
         tree = ElementTree.parse(path)
         suite = tree.find("testsuite")
@@ -53,9 +53,9 @@ class ReportGateTests(unittest.TestCase):
         case = suite.find("testcase")
         assert case is not None
         suite.remove(case)
-        suite.set("tests", "20")
+        suite.set("tests", "32")
         tree.write(path)
-        with self.assertRaisesRegex(ValueError, "document: expected 21 cases, found 20"):
+        with self.assertRaisesRegex(ValueError, "document: expected 33 cases, found 32"):
             check_reports(self.directory)
 
     def test_nonzero_summary_refuses(self):
