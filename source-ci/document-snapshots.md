@@ -34,6 +34,8 @@ FSService admits at most 32 owned document transactions with one fixed bounded
 semaphore. Admission is cancellable and precedes coroutine/task creation or mutation.
 Only the task done callback returns the permit, including on failure; ACK does not.
 The URI coordinator and original lease remain held through transaction exit.
+Native account coverage excludes a competing same-URI write with an immediate
+LockAcquisitionError before mutation; it does not promise to wait for the coordinator.
 This bounds owned transactions, including continuations, but not incoming admission
 waiters. A global request admission limit remains an existing gap.
 

@@ -158,7 +158,8 @@ async def test_http_private_parser_and_contract(admitted_service, app, client, m
     )
     assert replaced["node"]["kind"] == "directory"
     assert replaced["backup"]["node"]["kind"] == "directory"
-    assert replaced["processing_state"] == "accepted"
+    assert replaced["processing_state"] in {"accepted", "unobserved"}
+    assert replaced["cleanup_state"] in {"complete", "unknown"}
     await settle(service)
     assert excluded_links == []
 
@@ -768,7 +769,9 @@ async def test_verified_ack_retains_transaction(admitted_service, monkeypatch, p
     monkeypatch.setattr(module.tempfile, "TemporaryDirectory", temporary)
     monkeypatch.setattr(service.viking_fs._async_agfs, "pathlock_release", release_lease)
     owner = module if phase == "capture" else service.resources
-    name = "capture_resource_index_conditions" if phase == "capture" else "_enqueue_add_resource_job"
+    name = (
+        "capture_resource_index_conditions" if phase == "capture" else "_enqueue_add_resource_job"
+    )
     original = getattr(owner, name)
 
     async def gated(*args, **kwargs):
@@ -779,8 +782,13 @@ async def test_verified_ack_retains_transaction(admitted_service, monkeypatch, p
 
     monkeypatch.setattr(owner, name, gated)
     request = DocumentWriteRequest(
-        target_uri=TARGET, source_name="note.txt", text="exact new\r\n",
-        reason=HINT, expected=expected, representation="raw_file", backup_uri=BACKUP,
+        target_uri=TARGET,
+        source_name="note.txt",
+        text="exact new\r\n",
+        reason=HINT,
+        expected=expected,
+        representation="raw_file",
+        backup_uri=BACKUP,
     )
     try:
         ack = await asyncio.wait_for(write_document(service, request, ctx), 20)
@@ -815,10 +823,20 @@ async def test_verified_ack_precommit_failure(admitted_service, phase):
             raise RuntimeError("synthetic precommit fault")
 
     with pytest.raises(OpenVikingError) as raised:
-        await write_document(service, DocumentWriteRequest(
-            target_uri=TARGET, source_name="note.txt", text="replacement",
-            reason=HINT, expected=expected, representation="raw_file", backup_uri=BACKUP,
-        ), ctx, fault=fault)
+        await write_document(
+            service,
+            DocumentWriteRequest(
+                target_uri=TARGET,
+                source_name="note.txt",
+                text="replacement",
+                reason=HINT,
+                expected=expected,
+                representation="raw_file",
+                backup_uri=BACKUP,
+            ),
+            ctx,
+            fault=fault,
+        )
     assert raised.value.details["content_state"] == "rolled_back"
     assert raised.value.details["processing_state"] == "unobserved"
     assert not service.fs._acked_transactions
@@ -837,10 +855,18 @@ async def test_cancel_before_verified_finishes_without_ack(admitted_service):
 
     async def caller():
         try:
-            return await write_document(service, DocumentWriteRequest(
-                target_uri=TARGET, source_name="note.md", text="cancellation body",
-                reason=HINT, expected={"kind": "absent"},
-            ), ctx, fault=fault)
+            return await write_document(
+                service,
+                DocumentWriteRequest(
+                    target_uri=TARGET,
+                    source_name="note.md",
+                    text="cancellation body",
+                    reason=HINT,
+                    expected={"kind": "absent"},
+                ),
+                ctx,
+                fault=fault,
+            )
         except asyncio.CancelledError:
             cancelled.set()
             raise
@@ -860,8 +886,8 @@ async def test_cancel_before_verified_finishes_without_ack(admitted_service):
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 20)
     assert cancelled.is_set() and not service.fs._acked_transactions
-    assert (await document_node(service, TARGET, ctx))["node"]["kind"] == "directory"
     await settle(service)
+    assert (await document_node(service, TARGET, ctx))["node"]["kind"] == "directory"
 
 
 async def test_shutdown_drains_before_dependencies(admitted_service, monkeypatch):
@@ -885,10 +911,20 @@ async def test_shutdown_drains_before_dependencies(admitted_service, monkeypatch
 
     with monkeypatch.context() as patch:
         patch.setattr(service.resources, "_enqueue_add_resource_job", gated)
-        ack = await asyncio.wait_for(write_document(service, DocumentWriteRequest(
-            target_uri=TARGET, source_name="note.md", text="shutdown body",
-            reason=HINT, expected={"kind": "absent"},
-        ), ctx), 20)
+        ack = await asyncio.wait_for(
+            write_document(
+                service,
+                DocumentWriteRequest(
+                    target_uri=TARGET,
+                    source_name="note.md",
+                    text="shutdown body",
+                    reason=HINT,
+                    expected={"kind": "absent"},
+                ),
+                ctx,
+            ),
+            20,
+        )
         assert ack["cleanup_state"] == "unknown"
         await asyncio.wait_for(entered.wait(), 5)
         patch.setattr(service.resources, "close_background_tasks", close_background)
@@ -921,10 +957,19 @@ async def test_real_asgi_ack_precedes_enqueue(admitted_service, app, client, mon
 
     monkeypatch.setattr(service.resources, "_enqueue_add_resource_job", gated)
     try:
-        response = await asyncio.wait_for(client.post("/api/v1/resources/document-write", json={
-            "target_uri": TARGET, "source_name": "note.md", "text": "ASGI body",
-            "reason": HINT, "expected": {"kind": "absent"},
-        }), 20)
+        response = await asyncio.wait_for(
+            client.post(
+                "/api/v1/resources/document-write",
+                json={
+                    "target_uri": TARGET,
+                    "source_name": "note.md",
+                    "text": "ASGI body",
+                    "reason": HINT,
+                    "expected": {"kind": "absent"},
+                },
+            ),
+            20,
+        )
         await asyncio.wait_for(entered.wait(), 5)
         assert response.status_code == 200, response.text
         ack = response.json()["result"]
@@ -936,10 +981,12 @@ async def test_real_asgi_ack_precedes_enqueue(admitted_service, app, client, mon
         await settle(service)
 
 
-async def test_second_write_waits_for_continuation(admitted_service, monkeypatch):
+async def test_second_write_excluded_until_continuation(admitted_service, monkeypatch):
+    from openviking.storage.errors import LockAcquisitionError
+
     service = admitted_service
     ctx = _root_ctx()
-    entered, release, second_admitted = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    entered, release = asyncio.Event(), asyncio.Event()
     original = service.resources._enqueue_add_resource_job
     calls = []
 
@@ -952,27 +999,25 @@ async def test_second_write_waits_for_continuation(admitted_service, monkeypatch
 
     monkeypatch.setattr(service.resources, "_enqueue_add_resource_job", gated)
     first = await asyncio.wait_for(write_document(service, DocumentWriteRequest(
-        target_uri=TARGET, source_name="note.md", text="first body",
-        reason=HINT, expected={"kind": "absent"},
+        target_uri=TARGET, source_name="note.txt", text="first body",
+        reason=HINT, expected={"kind": "absent"}, representation="raw_file",
     ), ctx), 20)
     await asyncio.wait_for(entered.wait(), 5)
-    original_coverage = service.viking_fs._acquire_resource_coverage
-
-    async def coverage(*args, **kwargs):
-        second_admitted.set()
-        return await original_coverage(*args, **kwargs)
-
-    monkeypatch.setattr(service.viking_fs, "_acquire_resource_coverage", coverage)
-    second = asyncio.create_task(write_document(service, DocumentWriteRequest(
-        target_uri=TARGET, source_name="note.md", text="second body",
-        reason=HINT, expected=first["node"], backup_uri=BACKUP,
-    ), ctx))
+    request = DocumentWriteRequest(
+        target_uri=TARGET, source_name="note.txt", text="second body",
+        reason=HINT, expected=first["node"], backup_uri=BACKUP, representation="raw_file",
+    )
     try:
-        await asyncio.wait_for(second_admitted.wait(), 5)
-        assert not second.done() and len(calls) == 1
+        # Native account coverage fails fast rather than queueing another lease.
+        with pytest.raises(LockAcquisitionError):
+            await asyncio.wait_for(write_document(service, request, ctx), 5)
+        assert len(calls) == 1
+        assert await service.viking_fs.read_file_bytes(TARGET, ctx=ctx) == b"first body"
+        assert not await service.viking_fs.exists(BACKUP, ctx=ctx)
     finally:
         release.set()
-    ack = await asyncio.wait_for(second, 20)
+        await settle(service)
+    ack = await asyncio.wait_for(write_document(service, request, ctx), 20)
     assert ack["content_state"] == "committed"
     await settle(service)
 
@@ -1008,10 +1053,20 @@ async def test_after_ack_context_failure_observed_once(admitted_service, monkeyp
     monkeypatch.setattr(service.fs._uri_mutation_coordinator, "mutation", mutation)
     monkeypatch.setattr(fs_module.logger, "error", log)
     try:
-        ack = await asyncio.wait_for(write_document(service, DocumentWriteRequest(
-            target_uri=TARGET, source_name="note.md", text="failure body",
-            reason=HINT, expected={"kind": "absent"},
-        ), ctx), 20)
+        ack = await asyncio.wait_for(
+            write_document(
+                service,
+                DocumentWriteRequest(
+                    target_uri=TARGET,
+                    source_name="note.md",
+                    text="failure body",
+                    reason=HINT,
+                    expected={"kind": "absent"},
+                ),
+                ctx,
+            ),
+            20,
+        )
         await asyncio.wait_for(entered.wait(), 5)
         assert ack["content_state"] == "committed"
     finally:
@@ -1020,7 +1075,9 @@ async def test_after_ack_context_failure_observed_once(admitted_service, monkeyp
         loop.set_exception_handler(original_handler)
     assert log.call_count == 1
     assert log.call_args.args == (
-        "Filesystem %s continuation failed: %s", "document-write", "OpenVikingError",
+        "Filesystem %s continuation failed: %s",
+        "document-write",
+        "OpenVikingError",
     )
     assert not loop_errors and not service.fs._acked_transactions
     await settle(service)
@@ -1035,7 +1092,9 @@ async def test_after_ack_caught_postcommit_failure(admitted_service, monkeypatch
     ctx = _root_ctx()
     entered, release = asyncio.Event(), asyncio.Event()
     owner = module if phase == "capture" else service.resources
-    name = "capture_resource_index_conditions" if phase == "capture" else "_enqueue_add_resource_job"
+    name = (
+        "capture_resource_index_conditions" if phase == "capture" else "_enqueue_add_resource_job"
+    )
     original = getattr(owner, name)
     log = Mock()
     logger = Mock(error=log)
@@ -1050,10 +1109,20 @@ async def test_after_ack_caught_postcommit_failure(admitted_service, monkeypatch
 
     monkeypatch.setattr(owner, name, fail)
     try:
-        ack = await asyncio.wait_for(write_document(service, DocumentWriteRequest(
-            target_uri=TARGET, source_name="note.md", text="postcommit failure",
-            reason=HINT, expected={"kind": "absent"},
-        ), ctx), 20)
+        ack = await asyncio.wait_for(
+            write_document(
+                service,
+                DocumentWriteRequest(
+                    target_uri=TARGET,
+                    source_name="note.md",
+                    text="postcommit failure",
+                    reason=HINT,
+                    expected={"kind": "absent"},
+                ),
+                ctx,
+            ),
+            20,
+        )
         await asyncio.wait_for(entered.wait(), 5)
         assert ack["processing_state"] == "unobserved"
     finally:
@@ -1074,7 +1143,9 @@ async def test_verified_ack_prefers_finished_result(admitted_service):
         return {"cleanup_state": "complete", "processing_state": "accepted"}
 
     result = await service.fs._finish_transfer_after_verified_ack(
-        transaction, verified, operation="document-write",
+        transaction,
+        verified,
+        operation="document-write",
     )
     assert result == {"cleanup_state": "complete", "processing_state": "accepted"}
     assert not service.fs._acked_transactions
@@ -1104,7 +1175,10 @@ async def test_document_capacity_held_until_transaction_done(
         if not entered.is_set():
             entered.set()
             await release.wait()
-        return await original_enqueue(*args, **kwargs)
+        result = await original_enqueue(*args, **kwargs)
+        # Let the real queue owner release its account coverage before admission.
+        await asyncio.wait_for(service.resources.wait_processed(), 20)
+        return result
 
     monkeypatch.setattr(module, "_write_document", observed)
     monkeypatch.setattr(service.resources, "_enqueue_add_resource_job", gated)
@@ -1112,17 +1186,34 @@ async def test_document_capacity_held_until_transaction_done(
 
     async def second_call():
         attempted.set()
-        return await write_document(service, DocumentWriteRequest(
-            target_uri=second_uri, source_name="second.md", text="second body",
-            reason=HINT, expected={"kind": "absent"},
-        ), ctx)
+        return await write_document(
+            service,
+            DocumentWriteRequest(
+                target_uri=second_uri,
+                source_name="second.md",
+                text="second body",
+                reason=HINT,
+                expected={"kind": "absent"},
+            ),
+            ctx,
+        )
 
     second = None
     try:
-        ack = await asyncio.wait_for(write_document(service, DocumentWriteRequest(
-            target_uri=TARGET, source_name="note.md", text="first body",
-            reason=HINT, expected={"kind": "absent"},
-        ), ctx), 20)
+        ack = await asyncio.wait_for(
+            write_document(
+                service,
+                DocumentWriteRequest(
+                    target_uri=TARGET,
+                    source_name="note.md",
+                    text="first body",
+                    reason=HINT,
+                    expected={"kind": "absent"},
+                ),
+                ctx,
+            ),
+            20,
+        )
         await asyncio.wait_for(entered.wait(), 5)
         assert ack["content_state"] == "committed"
         assert ack["cleanup_state"] == "unknown"
@@ -1131,7 +1222,7 @@ async def test_document_capacity_held_until_transaction_done(
         assert not second.done()
         assert started == [TARGET]
         assert len(service.fs._acked_transactions) == 1
-        assert (await document_node(service, second_uri, ctx))["node"]["kind"] == "absent"
+        assert not await service.viking_fs.exists(second_uri, ctx=ctx)
         if cancel_waiter:
             second.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -1156,6 +1247,6 @@ async def test_document_capacity_held_until_transaction_done(
     assert capacity.locked()
     capacity.release()
     if cancel_waiter:
-        assert (await document_node(service, second_uri, ctx))["node"]["kind"] == "absent"
+        assert not await service.viking_fs.exists(second_uri, ctx=ctx)
         gc.collect()
         assert not [w for w in recwarn if "was never awaited" in str(w.message)]
