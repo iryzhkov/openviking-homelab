@@ -1,0 +1,59 @@
+name: Document snapshot checks
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'openviking/**'
+      - 'openviking_cli/**'
+      - 'tests/**'
+      - 'source-ci/**'
+      - 'pyproject.toml'
+      - '.github/workflows/document-snapshots.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  document-snapshots:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          submodules: false
+      - name: Initialize disk scratch
+        shell: bash
+        run: |
+          set -euo pipefail
+          task_scratch="$GITHUB_WORKSPACE/.cache/document-snapshot-ci"
+          test "$(stat -f -c %T "$GITHUB_WORKSPACE")" != tmpfs
+          mkdir -p "$task_scratch/source" "$task_scratch/home" "$task_scratch/tmp"
+          printf 'HOME=%s\nTMPDIR=%s\nUV_CACHE_DIR=%s\n' "$task_scratch/home" "$task_scratch/tmp" "$task_scratch/uv-cache" >> "$GITHUB_ENV"
+          git archive HEAD openviking openviking_cli tests source-ci pyproject.toml | tar -x -C "$task_scratch/source"
+          git rev-parse HEAD > "$task_scratch/checkout.txt"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: '0.13.1'
+          enable-cache: false
+      - name: Check exact-source document and reindex suites
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE/.cache/document-snapshot-ci/source"
+          timeout -k 5 780 sh source-ci/run_document_snapshot_checks.sh
+      - name: Report bounded test evidence
+        if: always()
+        shell: bash
+        run: |
+          evidence="$GITHUB_WORKSPACE/.cache/document-snapshot-ci/source/relations-out"
+          for name in document reindex; do
+            if test -f "$evidence/$name-rc.txt"; then
+              printf '%s exit: ' "$name" >> "$GITHUB_STEP_SUMMARY"
+              cat "$evidence/$name-rc.txt" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          printf '\nUses digest-verified dependency-image native libraries; no exact-source native build claim.\n' >> "$GITHUB_STEP_SUMMARY"
