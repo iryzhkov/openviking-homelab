@@ -171,6 +171,11 @@ async def test_exact_directory_original_uri_and_protected_backup(admitted_servic
     await fs.write_file_bytes(TARGET + "/old.md", old, ctx=ctx)
     sidecar = b'{"relations":[]}'
     await fs.write_file_bytes(TARGET + "/.relations.json", sidecar, ctx=ctx)
+    from openviking.service import document_write
+
+    row = document_write._root_record(TARGET, 0, ctx, True)
+    row["vector"] = [0.1] * 2048
+    await fs._get_vector_store().upsert(row, ctx=ctx)
     await service.runtime_config_manager.patch_account(ctx.account_id, {"acl": {"enabled": True}})
     await fs.set_acl(TARGET, [{"principal": "user:" + ctx.user.user_id, "level": "manage"}],
                      acl_mode=AclMode.RESTRICTED, ctx=ctx)
