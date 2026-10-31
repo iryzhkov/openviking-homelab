@@ -102,7 +102,8 @@ class DocumentWriteRequest(_Closed):
     source_name: str
     text: str
     reason: str = ""
-    representation: Literal["ingest", "raw_file", "verbatim"] = "ingest"
+    representation: Literal["ingest", "raw_file", "verbatim", "exact_directory"] = "ingest"
+    contract_version: Literal[1, 2] = 1
     expected: Node
     backup_uri: str | None = None
 
@@ -127,6 +128,10 @@ class DocumentWriteRequest(_Closed):
             raise ValueError("raw_file requires an existing file expectation")
         if self.representation == "verbatim" and not self.target_uri.endswith(".verbatim"):
             raise ValueError("verbatim requires a .verbatim target")
+        if self.representation == "exact_directory" and (
+            self.contract_version != 2 or self.expected.kind != "directory"
+        ):
+            raise ValueError("exact_directory requires contract v2 and an existing directory")
         return self
 
 
@@ -467,7 +472,7 @@ async def _prepare(service, request, private, ctx):
     )
     if request.representation == "raw_file" and not resolved.root_is_file:
         raise FailedPreconditionError("Raw document parser did not produce one file")
-    if request.representation == "verbatim":
+    if request.representation in {"verbatim", "exact_directory"}:
         await store.cleanup(ref)
         writer = await ParseArtifactWriter.create(store)
         await writer.write_bytes("0001/0000.md", request.text.encode())
@@ -491,7 +496,7 @@ async def _prepare(service, request, private, ctx):
     )
     if len(inventory.entries) + (0 if root_is_file else 1) + 2 * directories > FORMAL_LIMIT:
         raise ResourceExhaustedError("Document formal-node limit exceeded")
-    if request.representation in {"raw_file", "verbatim"}:
+    if request.representation in {"raw_file", "verbatim", "exact_directory"}:
         rel = doc_rel if root_is_file else "0001/0000.md"
         if await store.read_bytes(ref, rel) != request.text.encode():
             raise FailedPreconditionError("Exact document input was transformed")
@@ -810,6 +815,8 @@ async def _write_document(service, request, ctx, *, fault):
                     "input_sha256": hashlib.sha256(request.text.encode()).hexdigest(),
                     "representation": "raw_file"
                     if root_is_file
+                    else "exact_directory"
+                    if request.representation == "exact_directory"
                     else "verbatim_directory"
                     if request.representation == "verbatim"
                     else "parsed_directory",

@@ -4,7 +4,7 @@
 
 from typing import Any, Dict, Literal, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openviking.core.path_variables import resolve_path_variables
@@ -29,10 +29,15 @@ router = APIRouter(prefix="/api/v1", tags=["resources"])
 
 # The document protocol is separate from the existing mutation/tree contracts.
 @router.get("/resources/document-write-contract")
-async def document_write_contract(_ctx: RequestContext = Depends(get_request_context)):
+async def document_write_contract(
+    version: int = Query(1, ge=1, le=2),
+    _ctx: RequestContext = Depends(get_request_context),
+):
     from openviking.server.models import Response
 
-    return Response(status="ok", result={"contract": "resources-document-write", "version": 1})
+    return Response(
+        status="ok", result={"contract": "resources-document-write", "version": version}
+    )
 
 
 @router.get("/resources/document-node")
