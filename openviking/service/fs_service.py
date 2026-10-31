@@ -33,6 +33,7 @@ from openviking.privacy.skill_restore import get_skill_name_from_uri, restore_sk
 from openviking.resource.uri_mutation_coordinator import UriMutationCoordinator
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
+from openviking.service import tree_replace
 from openviking.service.task_tracker import get_task_tracker, run_tracked_operation
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.service.task_work_index import get_enqueued_work_ids, get_task_context
@@ -72,8 +73,6 @@ from openviking_cli.exceptions import (
 )
 from openviking_cli.utils import VikingURI, get_logger
 from openviking_cli.utils.config import get_openviking_config
-
-from openviking.service import tree_replace
 
 logger = get_logger(__name__)
 

@@ -13,6 +13,9 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.exceptions import ExceptionMiddleware
+
 from openviking.observability.http_error_context import capture_public_http_error
 from openviking.server.config import (
     ServerConfig,
@@ -56,6 +59,7 @@ from openviking.server.routers import (
     webdav_router,
 )
 from openviking.server.timing_middleware import RequestTimingMiddleware
+from openviking.service.core import OpenVikingService
 from openviking.service.task_tracker import get_task_tracker
 from openviking_cli.exceptions import OpenVikingError
 from openviking_cli.utils import get_logger
@@ -67,10 +71,6 @@ from openviking_cli.utils.config import (
 )
 from openviking_cli.utils.logger import init_otel_log_handler_from_server_config
 from openviking_gateway.config import MOUNT_PATH as GATEWAY_MOUNT_PATH
-from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.middleware.exceptions import ExceptionMiddleware
-
-from openviking.service.core import OpenVikingService
 
 logger = get_logger(__name__)
 

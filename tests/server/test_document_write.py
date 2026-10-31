@@ -3,15 +3,15 @@
 import asyncio
 
 import pytest
+
 from openviking.config.embedding import AccountBoundEmbedder
 from openviking.server.auth import get_request_context
 from openviking.server.identity import RequestContext, Role
+from openviking.service.document_write import DocumentWriteRequest, document_node, write_document
 from openviking.storage.acl import AclMode
 from openviking.utils.media_processor import UnifiedResourceProcessor
 from openviking_cli.exceptions import ConflictError, OpenVikingError, PermissionDeniedError
 from openviking_cli.session.user_id import UserIdentifier
-
-from openviking.service.document_write import DocumentWriteRequest, document_node, write_document
 from tests.server import conftest as server_fixtures
 from tests.server import test_real_resource_producer_e2e as producer_fixtures
 
