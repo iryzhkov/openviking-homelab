@@ -32,7 +32,7 @@ expected={
 "openviking/storage/resource_rfv.py":"9b717ca45d1ec28656c0a529a8d91915030adbe2",
 "openviking/service/document_write.py":"0089a6e1067b237b23871efab593a518096e2e18",
 "openviking/server/routers/resources.py":"6ea192d7bb1d61bdf7dd63af14e9d0d845e3a42b",
-"tests/server/test_document_write.py":"390a19074461ffb9b58a2d1509a1d84c53835e49",
+"tests/server/test_document_write.py":"b254992f187f35b2c4f3ea599c9cca8b4b74223a",
 "tests/server/test_reindex_effect_bounds_e2e.py":"2b1dd889fae1c62eae141c1e586f12a7c5d00bbd"}
 rows={}
 for name,blob in expected.items():

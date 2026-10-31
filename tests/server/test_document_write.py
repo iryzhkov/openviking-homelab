@@ -1009,6 +1009,7 @@ async def test_second_write_excluded_until_continuation(admitted_service, monkey
                 text="first body",
                 reason=HINT,
                 expected=expected,
+                backup_uri=BASE + "/first-saved.md",
                 representation="raw_file",
             ),
             ctx,
