@@ -35,7 +35,9 @@ async def document_write_contract(
 ):
     from openviking.server.models import Response
 
-    return Response(status="ok", result={"contract": "resources-document-write", "version": version})
+    return Response(
+        status="ok", result={"contract": "resources-document-write", "version": version}
+    )
 
 
 @router.get("/resources/document-node")

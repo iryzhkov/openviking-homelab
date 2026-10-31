@@ -95,7 +95,9 @@ async def test_http_private_parser_and_contract(admitted_service, app, client, m
     monkeypatch.setattr(MarkdownParser, "_ingest_local_images", forbidden)
     contract = await client.get("/api/v1/resources/document-write-contract")
     assert contract.json()["result"] == {"contract": "resources-document-write", "version": 1}
-    exact_contract = await client.get("/api/v1/resources/document-write-contract", params={"version": 2})
+    exact_contract = await client.get(
+        "/api/v1/resources/document-write-contract", params={"version": 2}
+    )
     assert exact_contract.json()["result"] == {"contract": "resources-document-write", "version": 2}
     before = await client.get("/api/v1/resources/document-node", params={"uri": TARGET})
     assert before.json()["result"]["node"] == {"kind": "absent"}
@@ -160,7 +162,6 @@ async def test_http_private_parser_and_contract(admitted_service, app, client, m
     assert excluded_links == []
 
 
-
 async def test_exact_directory_original_uri_and_protected_backup(admitted_service):
     from pydantic import ValidationError
 
@@ -177,14 +178,24 @@ async def test_exact_directory_original_uri_and_protected_backup(admitted_servic
     row["vector"] = [0.1] * 2048
     await fs._get_vector_store().upsert(row, ctx=ctx)
     await service.runtime_config_manager.patch_account(ctx.account_id, {"acl": {"enabled": True}})
-    await fs.set_acl(TARGET, [{"principal": "user:" + ctx.user.user_id, "level": "manage"}],
-                     acl_mode=AclMode.RESTRICTED, ctx=ctx)
+    await fs.set_acl(
+        TARGET,
+        [{"principal": "user:" + ctx.user.user_id, "level": "manage"}],
+        acl_mode=AclMode.RESTRICTED,
+        ctx=ctx,
+    )
     expected = (await document_node(service, TARGET, ctx))["node"]
     body = "# Original Ω\n\n## Decisions 漢字\n\n" + ("  cobalt Ω  \t\n\n" * 650) + "\r\n "
     raw = body.encode("utf-8")
     assert len(raw) > len(body) > 6000
-    values = dict(target_uri=TARGET, source_name="note.md", text=body,
-                  representation="exact_directory", expected=expected, backup_uri=BACKUP)
+    values = dict(
+        target_uri=TARGET,
+        source_name="note.md",
+        text=body,
+        representation="exact_directory",
+        expected=expected,
+        backup_uri=BACKUP,
+    )
     with pytest.raises(ValidationError):
         DocumentWriteRequest(**values)
     request = DocumentWriteRequest(**values, contract_version=2)
@@ -199,8 +210,9 @@ async def test_exact_directory_original_uri_and_protected_backup(admitted_servic
     assert (await document_node(service, BACKUP, ctx))["node"]["kind"] == "absent"
     current_sidecar = await fs.read_file_bytes(TARGET + "/.relations.json", ctx=ctx)
     values["expected"] = (await document_node(service, TARGET, ctx))["node"]
-    result = await asyncio.wait_for(write_document(
-        service, DocumentWriteRequest(**values, contract_version=2), ctx), timeout=60)
+    result = await asyncio.wait_for(
+        write_document(service, DocumentWriteRequest(**values, contract_version=2), ctx), timeout=60
+    )
     assert result["uri"] == TARGET and result["representation"] == "exact_directory"
     assert result["content_state"] == "committed", result
     assert await fs.read_file_bytes(TARGET + "/0001/0000.md", ctx=ctx) == raw

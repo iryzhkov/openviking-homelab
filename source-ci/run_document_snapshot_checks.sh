@@ -28,7 +28,8 @@ import ast,hashlib,json,pathlib
 expected={
 "openviking/storage/resource_rfv.py":"9b717ca45d1ec28656c0a529a8d91915030adbe2",
 "openviking/service/document_write.py":"4dd84dcf279c2f860571a03e81419443696e124c",
-"tests/server/test_document_write.py":"166406628eb1d39d177ea47c3feb749430e8f5d0",
+"openviking/server/routers/resources.py":"6ea192d7bb1d61bdf7dd63af14e9d0d845e3a42b",
+"tests/server/test_document_write.py":"7c47139cea62e835f9342e4a330e0ee5197812c0",
 "tests/server/test_reindex_effect_bounds_e2e.py":"2b1dd889fae1c62eae141c1e586f12a7c5d00bbd"}
 rows={}
 for name,blob in expected.items():
