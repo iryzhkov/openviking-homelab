@@ -188,14 +188,14 @@ async def test_exact_directory_original_uri_and_protected_backup(admitted_servic
     body = "# Original Ω\n\n## Decisions 漢字\n\n" + ("  cobalt Ω  \t\n\n" * 650) + "\r\n "
     raw = body.encode("utf-8")
     assert len(raw) > len(body) > 6000
-    values = dict(
-        target_uri=TARGET,
-        source_name="note.md",
-        text=body,
-        representation="exact_directory",
-        expected=expected,
-        backup_uri=BACKUP,
-    )
+    values = {
+        "target_uri": TARGET,
+        "source_name": "note.md",
+        "text": body,
+        "representation": "exact_directory",
+        "expected": expected,
+        "backup_uri": BACKUP,
+    }
     with pytest.raises(ValidationError):
         DocumentWriteRequest(**values)
     request = DocumentWriteRequest(**values, contract_version=2)
